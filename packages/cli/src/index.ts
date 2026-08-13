@@ -2,6 +2,7 @@
 import { isEngineError } from '@confluence/core';
 import { AppConfig } from './config.js';
 import { chatCommand, compareCommand, doctorCommand, taskCommand, usageCommand } from './commands/misc.js';
+import { mcpCommand } from './commands/mcp.js';
 import { providerCommand, flag } from './commands/provider.js';
 import { runCommand } from './commands/run.js';
 import { c, err, heading, kv, line, table } from './ui.js';
@@ -21,6 +22,8 @@ async function main(argv: string[]): Promise<number> {
     switch (cmd) {
       case 'provider':
         return await providerCommand(cfg, argv.slice(1));
+      case 'mcp':
+        return await mcpCommand(cfg, argv.slice(1));
       case 'model':
         return modelCommand(cfg, argv.slice(1));
       case 'run':
@@ -55,6 +58,7 @@ function help(): number {
   kv('chat', '交互式对话，可中途切换模型', 22);
   kv('compare "<问题>"', '同一个问题并排跑多个模型，对比效果与成本', 22);
   kv('provider', '管理服务商：ls / presets / add / set-key / test / rm', 22);
+  kv('mcp', '管理 MCP 服务器：ls / add / rm / test', 22);
   kv('model ls [id]', '列出某个服务商的模型', 22);
   kv('task', '任务：ls / show / trace / rollback', 22);
   kv('usage', '用量与花费统计', 22);

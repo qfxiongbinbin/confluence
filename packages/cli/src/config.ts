@@ -13,6 +13,7 @@ import {
   defaultDataRoot,
   findPreset,
   resolveQuirks,
+  type McpServerConfig,
   type ProviderConfig,
   type SecretStore,
   type WireProtocol,
@@ -45,6 +46,8 @@ export class AppConfig {
   readonly prices = new PriceBook();
   private providersPath: string;
   private providers: ProviderRecord[];
+  private mcpPath: string;
+  private mcpServers: McpServerConfig[];
   private secretsCache?: SecretStore;
 
   constructor(dataRoot = process.env['CF_DATA_ROOT'] ?? defaultDataRoot()) {
@@ -54,6 +57,10 @@ export class AppConfig {
     this.providersPath = join(dataRoot, 'providers.json');
     this.providers = existsSync(this.providersPath)
       ? (JSON.parse(readFileSync(this.providersPath, 'utf8')) as ProviderRecord[])
+      : [];
+    this.mcpPath = join(dataRoot, 'mcp.json');
+    this.mcpServers = existsSync(this.mcpPath)
+      ? (JSON.parse(readFileSync(this.mcpPath, 'utf8')) as McpServerConfig[])
       : [];
     const fx = this.store.get('fx', null as null | { rate: number; source: string; fetchedAt: number });
     if (fx) this.prices.setFx({ from: 'USD', to: 'CNY', ...fx });
@@ -96,6 +103,36 @@ export class AppConfig {
 
   private persistProviders(): void {
     writeFileSync(this.providersPath, JSON.stringify(this.providers, null, 2), 'utf8');
+  }
+
+  listMcpServers(): McpServerConfig[] {
+    return this.mcpServers.map((server) => ({
+      ...server,
+      args: server.args ? [...server.args] : undefined,
+      env: server.env ? { ...server.env } : undefined,
+      headers: server.headers ? { ...server.headers } : undefined,
+    }));
+  }
+
+  getMcpServer(name: string): McpServerConfig | undefined {
+    const server = this.mcpServers.find((item) => item.name === name);
+    return server ? { ...server } : undefined;
+  }
+
+  upsertMcpServer(r: McpServerConfig): void {
+    const i = this.mcpServers.findIndex((server) => server.name === r.name);
+    if (i >= 0) this.mcpServers[i] = r;
+    else this.mcpServers.push(r);
+    this.persistMcpServers();
+  }
+
+  removeMcpServer(name: string): void {
+    this.mcpServers = this.mcpServers.filter((server) => server.name !== name);
+    this.persistMcpServers();
+  }
+
+  private persistMcpServers(): void {
+    writeFileSync(this.mcpPath, JSON.stringify(this.mcpServers, null, 2), 'utf8');
   }
 
   /** Never throws for the env case — that's the zero-config path. */

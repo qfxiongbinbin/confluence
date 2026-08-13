@@ -47,6 +47,7 @@ export type ErrorCode =
   | 'TOOL_TIMEOUT'
   | 'TOOL_EXEC_FAILED'
   // MCP
+  | 'MCP_CONFIG_INVALID'
   | 'MCP_SERVER_START_FAILED'
   | 'MCP_INIT_FAILED'
   | 'MCP_TOOL_CALL_FAILED'
@@ -181,6 +182,10 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
   TOOL_EXEC_FAILED: {
     severity: 'retryable',
     message: (c) => `工具 ${s(c.tool)} 执行失败：${s(c.detail)}。`,
+  },
+  MCP_CONFIG_INVALID: {
+    severity: 'actionable',
+    message: (c) => `MCP 服务器 ${s(c.name, '')} 配置无效：${s(c.detail, '缺少启动方式')}。请配置 command 或 url 后重试。`,
   },
   MCP_SERVER_START_FAILED: {
     severity: 'actionable',

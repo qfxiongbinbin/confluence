@@ -11,6 +11,8 @@ import {
   HttpTransport,
   McpClient,
   StdioTransport,
+  createMcpClient,
+  loadMcpTools,
   mcpToolToTool,
 } from '../dist/index.js';
 
@@ -49,6 +51,13 @@ function createMockStdioServer(version = '2026-07-28', mode = 'normal') {
   const script = join(directory, 'server.mjs');
   writeFileSync(script, mockServerSource);
   return new StdioTransport({ command: process.execPath, args: [script, version, mode] });
+}
+
+function createMockStdioConfig(name = 'mock-loader') {
+  const directory = mkdtempSync(join(tmpdir(), 'cf-mcp-loader-'));
+  const script = join(directory, 'server.mjs');
+  writeFileSync(script, mockServerSource);
+  return { name, command: process.execPath, args: [script] };
 }
 
 async function startHttpServer() {
@@ -175,6 +184,42 @@ test('不存在的 stdio command 映射为 MCP_SERVER_START_FAILED', async () =>
     () => client.start(),
     (error) => error instanceof EngineError && error.code === 'MCP_SERVER_START_FAILED',
   );
+});
+
+test('createMcpClient 支持 stdio、HTTP 并拒绝无效配置', async () => {
+  const stdioClient = createMcpClient(createMockStdioConfig('stdio-config'));
+  assert.ok(stdioClient instanceof McpClient);
+  await stdioClient.close();
+
+  const httpClient = createMcpClient({ name: 'http-config', url: 'http://127.0.0.1:1/mcp' });
+  assert.ok(httpClient instanceof McpClient);
+  await httpClient.close();
+
+  assert.throws(
+    () => createMcpClient({ name: 'invalid' }),
+    (error) => error instanceof EngineError && error.code === 'MCP_CONFIG_INVALID',
+  );
+});
+
+test('loadMcpTools 加载可执行工具并隔离失败与禁用配置', async (t) => {
+  const missingName = `cf-mcp-not-found-${Date.now()}`;
+  const loaded = await loadMcpTools([
+    createMockStdioConfig('good'),
+    { name: 'bad', command: missingName },
+    { name: 'disabled', command: missingName, disabled: true },
+  ]);
+  t.after(() => Promise.all(loaded.clients.map((client) => client.close())));
+
+  assert.equal(loaded.clients.length, 1);
+  assert.equal(loaded.failures.length, 1);
+  assert.equal(loaded.failures[0].name, 'bad');
+  assert.ok(loaded.failures[0].error instanceof EngineError);
+  assert.equal(loaded.tools.length, 1);
+  assert.equal(loaded.tools[0].name, 'mcp__good__echo');
+
+  const result = await loaded.tools[0].execute({ text: '加载成功' }, {});
+  assert.equal(result.ok, true);
+  assert.equal(result.content, 'stdio:加载成功');
 });
 
 test('adapter 按 annotations 映射 risk 并清理工具名', () => {

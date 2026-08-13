@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import {
   AgentRunner,
   PermissionEngine,
@@ -7,7 +8,9 @@ import {
   defaultProfile,
   detectSandbox,
   isEngineError,
+  loadMcpTools,
   type AgentRunOptions,
+  type McpServerConfig,
   type Message,
   type PermissionAnswer,
   type PermissionMode,
@@ -69,6 +72,10 @@ export async function runCommand(cfg: AppConfig, args: string[]): Promise<number
   const taskId = `task_${randomUUID().slice(0, 8)}`;
   const client = cfg.client({ modelId: target.modelId, onWarning: (m) => warn(m) });
   const tools = new ToolRegistry();
+  const mcpConfigs = mergeMcpConfigs(cfg.listMcpServers(), loadProjectMcp(workingDir));
+  const mcp = await loadMcpTools(mcpConfigs);
+  for (const tool of mcp.tools) tools.register(tool);
+  for (const failure of mcp.failures) warn(`MCP 服务器 ${failure.name} 启动失败：${failure.error.userMessage}`);
   const permissions = new PermissionEngine(profile, workingDir, cfg.dataRoot);
   const runner = new AgentRunner(client, tools, permissions, cfg.prices, makeResolver(profile.mode));
 
@@ -89,6 +96,7 @@ export async function runCommand(cfg: AppConfig, args: string[]): Promise<number
   kv('模型', `${target.providerId}/${target.modelId}`);
   kv('权限模式', `${profile.mode}${profile.sandboxLevel === 'none' ? c.yellow('（无沙箱）') : ''}`);
   kv('网络', profile.network === 'none' ? '禁止出站' : `${profile.network} ${profile.allowedDomains.join(',')}`);
+  if (mcp.tools.length > 0) kv('MCP', `${mcp.tools.length} 个工具（${mcp.clients.length} 个服务器）`);
   line();
 
   const controller = new AbortController();
@@ -183,6 +191,7 @@ export async function runCommand(cfg: AppConfig, args: string[]): Promise<number
     }
   } finally {
     process.off('SIGINT', onSigint);
+    await Promise.all(mcp.clients.map((mcpClient) => mcpClient.close().catch(() => {})));
   }
 
   // Persist everything so the task is resumable and auditable.
@@ -242,6 +251,32 @@ function buildProfile(workingDir: string, args: string[]): PermissionProfile {
   for (const path of multiFlag(args, '--allow-path')) p.allowedPaths.push(resolve(path));
   if (flag(args, '--sandbox') === 'none') p.sandboxLevel = 'none';
   return p;
+}
+
+function loadProjectMcp(workingDir: string): McpServerConfig[] {
+  const path = join(workingDir, '.mcp.json');
+  if (!existsSync(path)) return [];
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!isRecord(parsed) || !isRecord(parsed['mcpServers'])) throw new Error('mcpServers 必须是对象');
+    return Object.entries(parsed['mcpServers']).map(([name, config]) => {
+      if (!isRecord(config)) throw new Error(`服务器 ${name} 的配置必须是对象`);
+      return { ...config, name } as McpServerConfig;
+    });
+  } catch (error) {
+    warn(`无法读取项目 MCP 配置 ${path}：${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+function mergeMcpConfigs(global: McpServerConfig[], project: McpServerConfig[]): McpServerConfig[] {
+  const merged = new Map(global.map((config) => [config.name, config]));
+  for (const config of project) merged.set(config.name, config);
+  return [...merged.values()];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function makeResolver(mode: PermissionMode) {
