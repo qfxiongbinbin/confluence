@@ -46,6 +46,13 @@ export type ErrorCode =
   | 'TOOL_BAD_ARGS'
   | 'TOOL_TIMEOUT'
   | 'TOOL_EXEC_FAILED'
+  // MCP
+  | 'MCP_SERVER_START_FAILED'
+  | 'MCP_INIT_FAILED'
+  | 'MCP_TOOL_CALL_FAILED'
+  | 'MCP_TIMEOUT'
+  | 'MCP_INVALID_RESPONSE'
+  | 'MCP_TRANSPORT_FAILED'
   // engine
   | 'ENGINE_ABORTED'
   | 'ENGINE_MAX_STEPS'
@@ -174,6 +181,30 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
   TOOL_EXEC_FAILED: {
     severity: 'retryable',
     message: (c) => `工具 ${s(c.tool)} 执行失败：${s(c.detail)}。`,
+  },
+  MCP_SERVER_START_FAILED: {
+    severity: 'actionable',
+    message: (c) => `无法启动 MCP 服务器 ${s(c.name, '')}：${s(c.detail, '未知错误')}。请检查命令路径与参数，或运行 \`cf doctor\` 排查。`,
+  },
+  MCP_INIT_FAILED: {
+    severity: 'actionable',
+    message: (c) => `MCP 服务器 ${s(c.name, '')} 初始化失败：${s(c.detail, '握手未完成')}。请检查服务器日志与 MCP 配置后重试。`,
+  },
+  MCP_TOOL_CALL_FAILED: {
+    severity: 'retryable',
+    message: (c) => `MCP 工具 ${s(c.tool, s(c.method))} 调用失败：${s(c.detail, '服务器返回错误')}。请检查工具参数与服务器日志后重试。`,
+  },
+  MCP_TIMEOUT: {
+    severity: 'actionable',
+    message: (c) => `MCP 服务器 ${s(c.name, '')} 的 ${s(c.method, '请求')} 超时（${s(c.timeoutMs)}ms）。请缩小任务范围或调大 MCP 超时时间后重试。`,
+  },
+  MCP_INVALID_RESPONSE: {
+    severity: 'fatal',
+    message: (c) => `MCP 服务器 ${s(c.name, '')} 返回了无效响应：${s(c.detail, '格式不符合协议')}。请升级或修复该 MCP 服务器后重试。`,
+  },
+  MCP_TRANSPORT_FAILED: {
+    severity: 'actionable',
+    message: (c) => `与 MCP 服务器 ${s(c.name, '')} 的连接失败：${s(c.detail, '传输已中断')}。请检查服务器状态、网络或进程日志后重试。`,
   },
   ENGINE_ABORTED: { severity: 'fatal', message: () => `任务已中止。轨迹已保存，可用 \`cf task resume <id>\` 从断点继续。` },
   ENGINE_MAX_STEPS: {

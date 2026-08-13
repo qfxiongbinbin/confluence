@@ -34,6 +34,8 @@ export {
 export { runCommandTool } from './tools/shell.js';
 export { httpFetchTool } from './tools/http.js';
 
+export * from './mcp/index.js';
+
 export * from './agent/context.js';
 export * from './agent/loop.js';
 
