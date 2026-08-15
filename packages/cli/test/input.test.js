@@ -92,3 +92,49 @@ test('decodeKey 按 UTF-8 字节数解析中文字符', () => {
   assert.deepEqual(decodeKey(buffer.subarray(Buffer.byteLength('中'))), { key: '文', consumed: Buffer.byteLength('文') });
   assert.deepEqual(decodeKey(buffer.subarray(0, 2)), { key: '', consumed: 0 });
 });
+
+test('decodeKey 解析按词跳转与翻页等修饰键序列', () => {
+  assert.deepEqual(decodeKey(Buffer.from('\u001b[1;5C')), { key: 'word-right', consumed: 6 });
+  assert.deepEqual(decodeKey(Buffer.from('\u001b[1;5D')), { key: 'word-left', consumed: 6 });
+  assert.deepEqual(decodeKey(Buffer.from('\u001bb')), { key: 'word-left', consumed: 2 });
+  assert.deepEqual(decodeKey(Buffer.from('\u001bf')), { key: 'word-right', consumed: 2 });
+  assert.deepEqual(decodeKey(Buffer.from([0x17])), { key: 'delete-word', consumed: 1 });
+  assert.deepEqual(decodeKey(Buffer.from('\u001b[5~')), { key: 'pageup', consumed: 4 });
+  assert.deepEqual(decodeKey(Buffer.from('\u001b[6~')), { key: 'pagedown', consumed: 4 });
+});
+
+test('wordLeft/wordRight 跳过空白跨词移动，且可跨行', () => {
+  const input = new InputBuffer();
+  input.insert('hello  world\n第二行');
+  input.end();
+  input.wordLeft(); // 跳到「第二行」词首
+  assert.equal(input.state.cursor.row, 1);
+  assert.equal(input.state.cursor.col, 0);
+  input.wordLeft(); // 跳过换行与空白，回到 world 词首
+  assert.equal(input.state.cursor.row, 0);
+  assert.equal(input.state.cursor.col, 7);
+  input.wordRight(); // 跳过 world，到其词尾（offset 与下一行行首等价）
+  assert.equal(input.state.cursor.row, 0);
+  assert.equal(input.state.cursor.col, 12);
+  input.wordRight(); // 到「第二行」词尾
+  assert.equal(input.state.cursor.row, 1);
+  assert.equal(input.state.cursor.col, 3);
+});
+
+test('deleteWordBackward 删除前一个词', () => {
+  const input = new InputBuffer();
+  input.insert('foo bar');
+  input.deleteWordBackward();
+  assert.equal(input.value, 'foo ');
+  input.deleteWordBackward();
+  assert.equal(input.value, '');
+});
+
+test('handleKey 忽略命名按键，不会把 pageup 之类插进文本', () => {
+  const input = new InputBuffer();
+  input.handleKey('pageup');
+  input.handleKey('pagedown');
+  input.handleKey('ctrl-c');
+  input.handleKey('word-left');
+  assert.equal(input.value, '');
+});
