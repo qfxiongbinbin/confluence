@@ -32,6 +32,9 @@ node packages/cli/dist/index.js doctor
 
 # 真跑一个任务
 node packages/cli/dist/index.js run "把当前目录的 md 文件整理成一个索引" --mode smart
+
+# 裸敲 cf 进入全屏 Agent TUI
+node packages/cli/dist/index.js
 ```
 
 建个别名会顺手很多：`alias cf='node ~/confluence/packages/cli/dist/index.js'`
@@ -74,6 +77,8 @@ node packages/cli/dist/index.js run "把当前目录的 md 文件整理成一个
 - **应用自身的凭据目录**（读也拒绝）—— 否则 Agent 能通过 shell 读到自己的 API Key
 
 前四条防的是「在沙箱里埋后门，下次逃逸」。最后一条是 Agent 客户端特有的漏洞。
+
+所有路径检查都先做真实路径解析（symlink 跟随）：一个名字无害、但指向 `~/.ssh` 或凭据目录的符号链接同样会被拦截，不会因为链接本身在词法上位于工作目录内就放行。
 
 ### 3. OS 级沙箱（PRD F4.3，核心差异化）
 
@@ -123,6 +128,7 @@ fail-closed 是刻意的：bwrap 不可用时**拒绝执行**，而不是像 Cla
 ## 命令
 
 ```
+cf                    全屏 Agent TUI，支持多轮、工具、权限确认和 /命令
 cf run "<任务>"        让 Agent 干活
 cf chat               交互式对话，/model 可中途切换
 cf compare "<问题>" -m a -m b    并排跑多个模型，对比效果、延迟、成本
@@ -150,12 +156,14 @@ cf doctor             自检
 
 代理：`cf config proxy http://127.0.0.1:7890`。注意这只影响**模型 API 出站**；Agent 工具的网络访问由任务的 `--network` 单独管，两条链路是分开的。
 
+TUI 支持 `/exit`、`/clear`、`/model <id>`、`/cost`、`/help`。当前按字符索引计算输入光标列，中文等宽字符可能出现视觉偏移；多行输入的上下键只在行间移动，历史浏览仅用于单行输入。
+
 ---
 
 ## 测试
 
 ```bash
-npm run check      # 70 个单测 + 14 项端到端冒烟
+npm run check      # 100 个单测 + 14 项端到端冒烟
 ```
 
 - `compat.test.js` —— provider 兼容性套件。**mock server 会像真实 API 一样失败**：不回传 reasoning_content 就返回 400，不开思考就返回 400，temperature=0 就报错。这是 PRD 要求的「对任意新接入的 provider 一键跑通」。

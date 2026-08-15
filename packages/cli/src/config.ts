@@ -156,7 +156,7 @@ export class AppConfig {
       this.secretsCache = new ChainedSecretStore(env, new EncryptedFileSecretStore(join(this.dataRoot, 'vault.json'), pw));
       return this.secretsCache;
     }
-    this.secretsCache = new ChainedSecretStore(env, new KeychainSecretStore());
+    this.secretsCache = new ChainedSecretStore(env, new KeychainSecretStore(join(this.dataRoot, 'keychain-index.json')));
     return this.secretsCache;
   }
 

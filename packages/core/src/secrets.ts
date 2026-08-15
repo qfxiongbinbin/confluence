@@ -64,6 +64,12 @@ export class EnvSecretStore implements SecretStore {
 
 export class KeychainSecretStore implements SecretStore {
   readonly backend = 'keychain' as const;
+  /** Optional index file tracking which entries we put in the OS keychain. */
+  private readonly indexPath?: string;
+
+  constructor(indexPath?: string) {
+    this.indexPath = indexPath;
+  }
 
   static available(): boolean {
     if (process.platform === 'darwin') return which('security') !== undefined;
@@ -97,6 +103,7 @@ export class KeychainSecretStore implements SecretStore {
       execFileSync('security', ['add-generic-password', '-U', '-s', SERVICE, '-a', acct, '-w', apiKey], {
         stdio: 'ignore',
       });
+      this.record(acct, providerId, label);
       return;
     }
     const r = spawnSync('secret-tool', ['store', '--label', `${SERVICE} ${acct}`, 'service', SERVICE, 'account', acct], {
@@ -106,6 +113,7 @@ export class KeychainSecretStore implements SecretStore {
     if (r.status !== 0) {
       throw new EngineError('CONFIG_INVALID', { detail: `写入 Secret Service 失败：${r.stderr ?? ''}` });
     }
+    this.record(acct, providerId, label);
   }
 
   delete(providerId: string, label = 'default'): void {
@@ -119,11 +127,40 @@ export class KeychainSecretStore implements SecretStore {
     } catch {
       /* already gone */
     }
+    this.forget(acct);
   }
 
   /** The OS keychain has no cheap enumerate; we track labels in an index file. */
   list(): { providerId: string; label: string }[] {
-    return [];
+    return Object.values(this.readIndex());
+  }
+
+  private readIndex(): Record<string, { providerId: string; label: string }> {
+    if (!this.indexPath) return {};
+    try {
+      if (!existsSync(this.indexPath)) return {};
+      return JSON.parse(readFileSync(this.indexPath, 'utf8')) as Record<string, { providerId: string; label: string }>;
+    } catch {
+      return {};
+    }
+  }
+
+  private writeIndex(idx: Record<string, { providerId: string; label: string }>): void {
+    if (!this.indexPath) return;
+    mkdirSync(dirname(this.indexPath), { recursive: true });
+    writeFileSync(this.indexPath, JSON.stringify(idx, null, 2), 'utf8');
+  }
+
+  private record(acct: string, providerId: string, label: string): void {
+    const idx = this.readIndex();
+    idx[acct] = { providerId, label };
+    this.writeIndex(idx);
+  }
+
+  private forget(acct: string): void {
+    const idx = this.readIndex();
+    delete idx[acct];
+    this.writeIndex(idx);
   }
 }
 
@@ -242,7 +279,7 @@ export function resolveSecretStore(opts: ResolveSecretStoreOptions): SecretStore
             : '当前平台不支持系统密钥链，请改用加密文件模式。',
       });
     }
-    return new KeychainSecretStore();
+    return new KeychainSecretStore(join(opts.dataRoot, 'keychain-index.json'));
   }
   if (!opts.masterPassword) {
     throw new EngineError('CONFIG_INVALID', {

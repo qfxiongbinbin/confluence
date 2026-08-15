@@ -108,6 +108,14 @@ export class ModelClient {
         );
       }
 
+      // Client-side concurrency cap: wait for a free slot before sending, so
+      // concurrency-metered providers (DeepSeek) aren't hammered past their
+      // limit. Server 429 backoff remains the fallback for the rest.
+      const concurrencyLimit = concurrencyLimitFor(provider.quirks);
+      if (concurrencyLimit !== undefined) {
+        await this.acquireConcurrency(provider.id, concurrencyLimit, req.signal);
+      }
+
       const ctx: WireContext = {
         providerId: provider.id,
         baseUrl: provider.baseUrl,
@@ -253,6 +261,18 @@ export class ModelClient {
     }
   }
 
+  /**
+   * Wait until a concurrency-metered provider has a free slot. Polled because
+   * the CLI is single-process and slots are short; the injected `sleep` keeps
+   * it deterministic under test.
+   */
+  private async acquireConcurrency(id: string, limit: number, signal?: AbortSignal): Promise<void> {
+    while ((this.inflight.get(id) ?? 0) >= limit) {
+      if (signal?.aborted) throw new EngineError('ENGINE_ABORTED', {});
+      await this.opts.sleep(50);
+    }
+  }
+
   private bump(id: string, delta: number): void {
     this.inflight.set(id, Math.max(0, (this.inflight.get(id) ?? 0) + delta));
   }
@@ -314,6 +334,13 @@ export class MessageAssembler {
     if (this.reasoning) m.reasoningContent = this.reasoning;
     return m;
   }
+}
+
+/** The client-side in-flight cap implied by this provider's metering. */
+function concurrencyLimitFor(q: ProviderQuirks): number | undefined {
+  if (q.rateLimit.kind === 'concurrency') return q.rateLimit.limit;
+  if (q.rateLimit.kind === 'tiered') return q.rateLimit.concurrency;
+  return undefined;
 }
 
 function parseRetryAfter(v: string | null): number | undefined {
