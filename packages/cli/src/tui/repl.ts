@@ -28,14 +28,40 @@ import { Term } from './term.js';
 const DOUBLE_CTRL_C_MS = 1_200;
 const PASTE_END = Buffer.from('\u001b[201~');
 
+interface SlashCommand {
+  name: string;
+  desc: string;
+  /** 需要参数的命令，Tab 只补全命令名并留一个空格。 */
+  takesArg?: boolean;
+}
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: '/help', desc: '查看可用命令与按键' },
+  { name: '/model', desc: '选择/切换模型', takesArg: true },
+  { name: '/cost', desc: '查看本次 token 与累计花费' },
+  { name: '/clear', desc: '清空输出区' },
+  { name: '/exit', desc: '退出 TUI' },
+];
+
 export async function replCommand(cfg: AppConfig): Promise<number> {
   const initialTarget = parseModel(undefined, cfg.settings());
   if (!initialTarget) {
     err('未指定模型，且没有默认模型。运行 cf provider add <id> 先配置一个。');
     return 1;
   }
-  if (!cfg.getProviderRecord(initialTarget.providerId)) {
+  const providerRecord = cfg.getProviderRecord(initialTarget.providerId);
+  if (!providerRecord) {
     err(`未配置服务商 ${initialTarget.providerId}。运行 cf provider add ${initialTarget.providerId}`);
+    return 1;
+  }
+  // 记录存在还不够：client() 会静默跳过「无密钥/已禁用」的服务商，
+  // 等到提交任务才报「未知服务商」，提示具有误导性。这里提前校验。
+  if (!providerRecord.enabled) {
+    err(`服务商 ${initialTarget.providerId} 已禁用。运行 cf provider test ${initialTarget.providerId} 查看详情。`);
+    return 1;
+  }
+  if (!cfg.client({ modelId: initialTarget.modelId }).getProvider(initialTarget.providerId)) {
+    err(`服务商 ${initialTarget.providerId} 没有可用密钥。运行 cf provider set-key ${initialTarget.providerId} 配置后重试。`);
     return 1;
   }
 
@@ -62,6 +88,13 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
   let altScreenEntered = false;
   let rawModeEntered = false;
   let exitCode = 0;
+  // —— 模型选择器 ——
+  let pickerOptions: { providerId: string; modelId: string }[] = [];
+  let pickerIndex = 0;
+  let pickerOpen = false;
+  // —— 命令提示 ——
+  let hintsHidden = false; // 用户按 Esc 主动隐藏，直到输入再次变化
+  let hintIndex = 0;
   let resolveExit: (() => void) | undefined;
   const exitRequested = new Promise<void>((resolvePromise) => {
     resolveExit = resolvePromise;
@@ -76,8 +109,30 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     running: activeController !== undefined,
   });
 
+  /** 输入以 / 开头且单行时，列出前缀匹配的命令；否则关闭提示。 */
+  const syncHints = () => {
+    const value = input.value;
+    if (hintsHidden || !value.startsWith('/') || value.includes('\n')) {
+      screen.setHints(undefined);
+      return;
+    }
+    const matches = SLASH_COMMANDS.filter((c) => c.name.startsWith(value.split(' ')[0]!));
+    if (matches.length === 0) {
+      screen.setHints(undefined);
+      return;
+    }
+    hintIndex = Math.min(hintIndex, matches.length - 1);
+    screen.setHints({ items: matches.map((c) => `${c.name} — ${c.desc}`), index: hintIndex });
+  };
+
+  const hintMatches = () => {
+    const typed = input.value.split(' ')[0]!;
+    return SLASH_COMMANDS.filter((c) => c.name.startsWith(typed));
+  };
+
   const redraw = () => {
     screen.setStatus(status());
+    syncHints();
     term.hideCursor();
     term.write(screen.render(input.value, input.cursorOffset));
     term.showCursor();
@@ -289,7 +344,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       case '/model': {
         const spec = args.join(' ');
         if (!spec) {
-          screen.pushLine(`当前模型：${target.providerId}/${target.modelId}`);
+          openModelPicker();
           break;
         }
         const next = parseModel(spec, { defaultProvider: target.providerId, defaultModel: target.modelId });
@@ -305,11 +360,89 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
         screen.pushLine(`本次 token：输入 ${runTokensIn} / 输出 ${runTokensOut}；累计花费：${formatMoney(cumulativeCost)}`);
         break;
       case '/help':
-        screen.pushLine('/exit 退出 · /clear 清屏 · /model <id> 切换模型 · /cost 查看费用 · /help 帮助');
+        screen.pushLine('/exit 退出 · /clear 清屏 · /model 选择/切换模型 · /cost 查看费用 · /help 帮助');
+        screen.pushLine('Ctrl/Alt+←→ 按词跳转 · Ctrl+W 删词 · PageUp/PageDown 翻看历史输出 · Ctrl+L 清屏');
         break;
       default:
         screen.pushLine(`未知命令：${name}。输入 /help 查看可用命令。`);
     }
+  };
+
+  /** 打开模型选择器：列出所有「已启用且有密钥」的服务商的全部模型。 */
+  const openModelPicker = () => {
+    const client = cfg.client({ modelId: target.modelId });
+    const options: { providerId: string; modelId: string }[] = [];
+    for (const record of cfg.listProviders()) {
+      if (!record.enabled) continue;
+      if (!client.getProvider(record.id)) continue; // 无密钥的列出来也切不过去
+      for (const model of cfg.modelsFor(record.id)) {
+        options.push({ providerId: record.id, modelId: model.id });
+      }
+    }
+    if (options.length === 0) {
+      screen.pushLine('✗ 没有可切换的模型。运行 cf provider add <id> 先配置。');
+      return;
+    }
+    pickerOptions = options;
+    pickerIndex = Math.max(
+      0,
+      options.findIndex((o) => o.providerId === target.providerId && o.modelId === target.modelId),
+    );
+    pickerOpen = true;
+    syncPicker();
+  };
+
+  const closeModelPicker = () => {
+    pickerOpen = false;
+    screen.setPicker(undefined);
+  };
+
+  const syncPicker = () => {
+    const items = pickerOptions.map((o) => {
+      const current = o.providerId === target.providerId && o.modelId === target.modelId;
+      return `${o.providerId}/${o.modelId}${current ? '  ✓ 当前' : ''}`;
+    });
+    screen.setPicker({ title: '选择模型', items, index: pickerIndex });
+  };
+
+  /** 选择器打开期间接管所有按键。返回后由调用方统一重绘。 */
+  const handlePickerKey = (key: string) => {
+    const last = pickerOptions.length - 1;
+    switch (key) {
+      case 'up':
+        pickerIndex = Math.max(0, pickerIndex - 1);
+        break;
+      case 'down':
+        pickerIndex = Math.min(last, pickerIndex + 1);
+        break;
+      case 'home':
+        pickerIndex = 0;
+        break;
+      case 'end':
+        pickerIndex = last;
+        break;
+      case 'pageup':
+        pickerIndex = Math.max(0, pickerIndex - 8);
+        break;
+      case 'pagedown':
+        pickerIndex = Math.min(last, pickerIndex + 8);
+        break;
+      case 'enter': {
+        const option = pickerOptions[pickerIndex];
+        closeModelPicker();
+        if (!option) return;
+        target = option;
+        screen.pushLine(`✓ 已切换模型：${target.providerId}/${target.modelId}`);
+        break;
+      }
+      case 'escape':
+      case 'ctrl-c':
+        closeModelPicker();
+        break;
+      default:
+        break; // 其余按键在选择器打开时一律忽略
+    }
+    if (pickerOpen) syncPicker();
   };
 
   const handleCtrlC = () => {
@@ -344,7 +477,25 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       const decoded = decodeKey(pendingInput);
       if (decoded.consumed === 0) return;
       pendingInput = pendingInput.subarray(decoded.consumed);
-      if (decoded.key === 'paste-start') {
+      if (pickerOpen) {
+        // 选择器打开期间接管一切按键（含 ctrl-c：关选择器而不是退出）
+        handlePickerKey(decoded.key);
+        redraw();
+        continue;
+      }
+      const hintsActive = !hintsHidden && input.value.startsWith('/') && !input.value.includes('\n') && hintMatches().length > 0;
+      if (hintsActive && decoded.key === 'tab') {
+        const matches = hintMatches();
+        const pick = matches[hintIndex] ?? matches[0]!;
+        input.clear();
+        input.insert(pick.takesArg ? `${pick.name} ` : pick.name);
+      } else if (hintsActive && decoded.key === 'up') {
+        hintIndex = Math.max(0, hintIndex - 1);
+      } else if (hintsActive && decoded.key === 'down') {
+        hintIndex = Math.min(hintMatches().length - 1, hintIndex + 1);
+      } else if (hintsActive && decoded.key === 'escape') {
+        hintsHidden = true;
+      } else if (decoded.key === 'paste-start') {
         pasteMode = true;
       } else if (decoded.key === 'ctrl-c') {
         handleCtrlC();
@@ -357,8 +508,19 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
         } else {
           submit(input.commit());
         }
+      } else if (decoded.key === 'pageup' || decoded.key === 'pagedown') {
+        const page = Math.max(3, term.size().rows - 4);
+        screen.scrollBy(decoded.key === 'pageup' ? page : -page);
+      } else if (decoded.key === 'clear-screen') {
+        screen.clear();
       } else {
+        const before = input.value;
         input.handleKey(decoded.key);
+        if (input.value !== before) {
+          hintsHidden = false; // 输入变化后重新弹出提示
+          const matches = hintMatches();
+          if (hintIndex > matches.length - 1) hintIndex = 0;
+        }
       }
       redraw();
     }
@@ -454,7 +616,8 @@ function renderEvent(event: AgentEvent, context: EventRenderContext): void {
       context.screen.pushLine(`${event.ok ? '✓' : '✗'} ${event.summary} (${event.durationMs}ms)`);
       break;
     case 'file_changed':
-      context.screen.pushLine(`  ${event.op} ${event.path}`);
+      context.screen.pushMutedLine(`  ✎ ${event.op} ${event.path}`);
+      if (event.diff) context.screen.pushDiff(event.diff);
       break;
     case 'compaction':
       context.screen.pushLine(`! 上下文已压缩（折叠 ${event.removedMessages} 条消息）`);

@@ -18,6 +18,15 @@ const KEY_SEQUENCES = new Map<string, string>([
   ['\u001b[3~', 'delete'],
   ['\u001b[1~', 'home'],
   ['\u001b[4~', 'end'],
+  ['\u001b[5~', 'pageup'],
+  ['\u001b[6~', 'pagedown'],
+  ['\u001b[1;5C', 'word-right'],
+  ['\u001b[1;5D', 'word-left'],
+  ['\u001b[1;3C', 'word-right'],
+  ['\u001b[1;3D', 'word-left'],
+  ['\u001bb', 'word-left'],
+  ['\u001bf', 'word-right'],
+  ['\u001b\u007f', 'delete-word'],
   ['\u001b[200~', 'paste-start'],
   ['\u001b[201~', 'paste-end'],
 ]);
@@ -25,6 +34,7 @@ const KEY_SEQUENCES = new Map<string, string>([
 const CONTROL_KEYS = new Map<number, string>([
   [0x0d, 'enter'],
   [0x0a, 'enter'],
+  [0x09, 'tab'],
   [0x7f, 'backspace'],
   [0x08, 'backspace'],
   [0x03, 'ctrl-c'],
@@ -33,6 +43,8 @@ const CONTROL_KEYS = new Map<number, string>([
   [0x05, 'end'],
   [0x0b, 'delete-line'],
   [0x15, 'clear-line'],
+  [0x17, 'delete-word'],
+  [0x0c, 'clear-screen'],
 ]);
 
 export function decodeKey(buf: Buffer): DecodedKey {
@@ -194,20 +206,44 @@ export class InputBuffer {
     this.clampColumn();
   }
 
+  wordLeft(): void {
+    this.place(this.wordBoundary(this.cursorOffset, -1));
+  }
+
+  wordRight(): void {
+    this.place(this.wordBoundary(this.cursorOffset, 1));
+  }
+
+  deleteWordBackward(): void {
+    this.leaveHistory();
+    const end = this.cursorOffset;
+    const start = this.wordBoundary(end, -1);
+    if (start === end) return;
+    const value = this.value;
+    const next = `${value.slice(0, start)}${value.slice(end)}`;
+    const lines = next.split('\n');
+    this.state.lines.splice(0, this.state.lines.length, ...lines);
+    this.place(start);
+  }
+
   handleKey(key: string): void {
     switch (key) {
       case 'backspace': this.backspace(); break;
       case 'delete': this.deleteForward(); break;
       case 'left': this.left(); break;
       case 'right': this.right(); break;
-      case 'home': this.home(); break;
-      case 'end': this.end(); break;
       case 'up': this.up(); break;
       case 'down': this.down(); break;
+      case 'home': this.home(); break;
+      case 'end': this.end(); break;
+      case 'word-left': this.wordLeft(); break;
+      case 'word-right': this.wordRight(); break;
+      case 'delete-word': this.deleteWordBackward(); break;
       case 'delete-line': this.deleteToEnd(); break;
       case 'clear-line': this.clear(); break;
       default:
-        if (key.length > 0 && !key.startsWith('ctrl-') && key !== 'enter' && key !== 'escape') this.insert(key);
+        // 只接受单个码点文本；pageup 等命名按键与 ctrl- 组合键一律忽略
+        if (key.length === 1) this.insert(key);
     }
   }
 
@@ -249,6 +285,36 @@ export class InputBuffer {
     const { row, col } = this.state.cursor;
     this.state.lines[row] = chars(this.state.lines[row]!).slice(0, col).join('');
     this.state.lines.splice(row + 1);
+  }
+
+  /** 把光标移动到整串文本的第 offset 个码点处（跨行） */
+  private place(offset: number): void {
+    let remaining = offset;
+    for (let row = 0; row < this.state.lines.length; row++) {
+      const length = chars(this.state.lines[row]!).length;
+      if (remaining <= length || row === this.state.lines.length - 1) {
+        this.state.cursor.row = row;
+        this.state.cursor.col = Math.max(0, Math.min(remaining, length));
+        return;
+      }
+      remaining -= length + 1;
+    }
+  }
+
+  /** 从 offset 出发向 direction（-1 向左 / 1 向右）跳过一个空白分隔的词，返回新 offset */
+  private wordBoundary(offset: number, direction: 1 | -1): number {
+    const text = this.value;
+    const units = chars(text);
+    const bound = units.length;
+    let index = Math.max(0, Math.min(offset, bound));
+    if (direction < 0) {
+      while (index > 0 && /\s/.test(units[index - 1]!)) index--;
+      while (index > 0 && !/\s/.test(units[index - 1]!)) index--;
+      return index;
+    }
+    while (index < bound && /\s/.test(units[index]!)) index++;
+    while (index < bound && !/\s/.test(units[index]!)) index++;
+    return index;
   }
 
   private historyUp(): void {

@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// 注意：warnings.js 必须保持在所有 import 之首——它要赶在 node:sqlite
+// 首次加载前装好 warning 监听器，否则 ExperimentalWarning 会破坏 TUI 界面。
+import './warnings.js';
 import { isEngineError } from '@confluence/core';
 import { AppConfig } from './config.js';
 import { chatCommand, compareCommand, doctorCommand, taskCommand, usageCommand } from './commands/misc.js';
