@@ -10,7 +10,7 @@
 import { EngineError } from '../errors.js';
 import type { PermissionRequest } from '../events.js';
 import type { RiskLevel } from '../types.js';
-import { checkDeny, forcedDenyRead, forcedDenyWrite, isInside, toAbsolute, type DenyRule } from './deny.js';
+import { checkDeny, forcedDenyRead, forcedDenyWrite, isInside, resolveRealPath, toAbsolute, type DenyRule } from './deny.js';
 
 export type PermissionMode =
   /** Read-only. Any write or exec is refused outright. */
@@ -110,8 +110,11 @@ export class PermissionEngine {
     private readonly workingDir: string,
     appConfigDir: string,
   ) {
-    this.denyWrite = forcedDenyWrite(appConfigDir);
-    this.denyRead = forcedDenyRead(appConfigDir);
+    // Real-path the app dir so the deny rule matches the symlink-resolved path
+    // we check against below (e.g. /var -> /private/var on macOS).
+    const appReal = resolveRealPath(appConfigDir);
+    this.denyWrite = forcedDenyWrite(appReal);
+    this.denyRead = forcedDenyRead(appReal);
   }
 
   getProfile(): PermissionProfile {
@@ -133,6 +136,11 @@ export class PermissionEngine {
     return `${input.access}:${input.tool}`;
   }
 
+  /** Absolute, symlink-resolved form of a tool-reported path (relative → workingDir). */
+  private realPath(p: string): string {
+    return resolveRealPath(toAbsolute(this.workingDir, p));
+  }
+
   check(input: CheckInput): Decision {
     // 1. Tool enablement.
     if (this.profile.enabledTools !== 'all' && !this.profile.enabledTools.includes(input.tool)) {
@@ -140,8 +148,10 @@ export class PermissionEngine {
     }
 
     // 2. Forced deny lists. These beat every mode, including full_auto.
+    //    Paths are symlink-resolved so a link inside the working dir can't
+    //    point at ~/.ssh or the app's own credentials and slip past by name.
     for (const p of input.paths ?? []) {
-      const abs = toAbsolute(this.workingDir, p);
+      const abs = this.realPath(p);
       const rules = input.access === 'read' ? this.denyRead : this.denyWrite;
       const hit = checkDeny(rules, abs);
       if (hit.denied) {
@@ -156,13 +166,14 @@ export class PermissionEngine {
       }
     }
 
-    // 3. Path scope.
+    // 3. Path scope. Roots and the checked path are both resolved through
+    //    symlinks so a link can't point outside the allowed roots.
     for (const p of input.paths ?? []) {
-      const abs = toAbsolute(this.workingDir, p);
-      if (!this.profile.allowedPaths.some((root) => isInside(root, abs))) {
+      const abs = this.realPath(p);
+      if (!this.profile.allowedPaths.some((root) => isInside(resolveRealPath(root), abs))) {
         return deny('PERMISSION_PATH_OUT_OF_SCOPE', { path: abs });
       }
-      if (this.profile.deniedPaths.some((root) => isInside(root, abs))) {
+      if (this.profile.deniedPaths.some((root) => isInside(resolveRealPath(root), abs))) {
         return deny('PERMISSION_DENIED', { detail: `路径 ${abs} 在本任务的拒绝列表中`, mode: this.profile.mode });
       }
     }

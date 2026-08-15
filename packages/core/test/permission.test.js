@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -145,4 +145,26 @@ test('forcedDenyWrite 覆盖 systemd / cron / 登录项', () => {
   assert.equal(checkDeny(rules, '/etc/cron.d/evil').denied, true);
   assert.equal(checkDeny(rules, '/etc/systemd/system/x.service').denied, true);
   assert.equal(checkDeny(rules, join(work, 'src', 'index.ts')).denied, false);
+});
+
+test('符号链接逃逸：指向应用凭据目录的链接在词法安全时仍被拒', () => {
+  writeFileSync(join(appDir, 'vault.json'), 'sk-secret');
+  const link = join(work, 'notes.md');
+  symlinkSync(join(appDir, 'vault.json'), link);
+  // 词法上 notes.md 在 work 内且不匹配任何 deny 规则，但真实目标在拒绝目录。
+  const e = engine({ mode: 'full_auto', allowedPaths: [work] });
+  const d = e.check({ tool: 'read_file', risk: 'low', access: 'read', paths: [link] });
+  assert.equal(d.outcome, 'deny');
+  assert.equal(d.error.code, 'PERMISSION_FORCED_DENY');
+});
+
+test('符号链接逃逸：指向工作目录外的链接被 scope 拦截', () => {
+  const outside = mkdtempSync(join(tmpdir(), 'cf-outside-'));
+  writeFileSync(join(outside, 'data.txt'), 'x');
+  const link = join(work, 'inside.md');
+  symlinkSync(join(outside, 'data.txt'), link);
+  const e = engine({ allowedPaths: [work] });
+  const d = e.check({ tool: 'read_file', risk: 'low', access: 'read', paths: [link] });
+  assert.equal(d.outcome, 'deny');
+  assert.equal(d.error.code, 'PERMISSION_PATH_OUT_OF_SCOPE');
 });

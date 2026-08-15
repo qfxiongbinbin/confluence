@@ -57,16 +57,31 @@ export function detectSandbox(force = false): SandboxCapability {
   const platform = process.platform;
 
   if (platform === 'darwin') {
-    const ok = existsSync('/usr/bin/sandbox-exec');
-    cached = ok
-      ? { backend: 'seatbelt', available: true, platform }
-      : {
-          backend: 'seatbelt',
-          available: false,
-          platform,
-          reason: '/usr/bin/sandbox-exec 不存在',
-          remedy: '这是 macOS 系统自带组件，缺失通常意味着系统被裁剪过。',
-        };
+    const bin = '/usr/bin/sandbox-exec';
+    if (!existsSync(bin)) {
+      cached = {
+        backend: 'seatbelt',
+        available: false,
+        platform,
+        reason: '/usr/bin/sandbox-exec 不存在',
+        remedy: '这是 macOS 系统自带组件，缺失通常意味着系统被裁剪过。',
+      };
+      return cached;
+    }
+    // Binary presence isn't enough: when this process already runs inside a
+    // Seatbelt sandbox, the kernel refuses a nested sandbox_apply at runtime.
+    // Probe like the Linux branch does instead of assuming.
+    if (!seatbeltProbeAvailable(bin)) {
+      cached = {
+        backend: 'seatbelt',
+        available: false,
+        platform,
+        reason: 'sandbox-exec 自检失败：当前环境不允许再套一层 Seatbelt 沙箱（常见于已在沙箱内运行）',
+        remedy: '在非沙箱环境中运行，或显式 --sandbox none 承担风险。',
+      };
+      return cached;
+    }
+    cached = { backend: 'seatbelt', available: true, platform };
     return cached;
   }
 
@@ -153,6 +168,33 @@ export function wrapCommand(
 // ---------------------------------------------------------------------------
 // macOS Seatbelt
 // ---------------------------------------------------------------------------
+
+/** Run a minimal profile through sandbox-exec to see whether it actually applies. */
+function seatbeltProbeAvailable(bin: string): boolean {
+  const dir = mkdtempSync(join(tmpdir(), 'cf-sb-probe-'));
+  try {
+    const profile = join(dir, 'probe.sb');
+    writeFileSync(
+      profile,
+      [
+        '(version 1)',
+        '(deny default)',
+        '(import "/System/Library/Sandbox/Profiles/bsd.sb")',
+        '(allow process-exec)',
+        '(allow file-read*)',
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const probe = spawnSync(bin, ['-f', profile, '/usr/bin/true'], { stdio: 'ignore', timeout: 5000 });
+    return probe.status === 0;
+  } finally {
+    try {
+      execFileSync('rm', ['-rf', dir], { stdio: 'ignore' });
+    } catch {
+      /* best effort */
+    }
+  }
+}
 
 function wrapSeatbelt(file: string, args: string[], spec: SandboxSpec): WrappedCommand {
   const dir = mkdtempSync(join(tmpdir(), 'cf-sb-'));
