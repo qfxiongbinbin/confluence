@@ -238,7 +238,7 @@ export async function runCommand(cfg: AppConfig, args: string[]): Promise<number
 
 // ---------------------------------------------------------------------------
 
-function buildProfile(workingDir: string, args: string[]): PermissionProfile {
+export function buildProfile(workingDir: string, args: string[]): PermissionProfile {
   const p = defaultProfile(workingDir);
   const mode = args.includes('--yes') ? 'full_auto' : (flag(args, '--mode') as PermissionMode | undefined);
   if (mode) p.mode = mode;
@@ -253,7 +253,7 @@ function buildProfile(workingDir: string, args: string[]): PermissionProfile {
   return p;
 }
 
-function loadProjectMcp(workingDir: string): McpServerConfig[] {
+export function loadProjectMcp(workingDir: string): McpServerConfig[] {
   const path = join(workingDir, '.mcp.json');
   if (!existsSync(path)) return [];
   try {
@@ -269,7 +269,7 @@ function loadProjectMcp(workingDir: string): McpServerConfig[] {
   }
 }
 
-function mergeMcpConfigs(global: McpServerConfig[], project: McpServerConfig[]): McpServerConfig[] {
+export function mergeMcpConfigs(global: McpServerConfig[], project: McpServerConfig[]): McpServerConfig[] {
   const merged = new Map(global.map((config) => [config.name, config]));
   for (const config of project) merged.set(config.name, config);
   return [...merged.values()];
@@ -279,7 +279,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function makeResolver(mode: PermissionMode) {
+export function makeResolver(mode: PermissionMode) {
   return async (req: PermissionRequest): Promise<PermissionAnswer> => {
     line();
     line(c.yellow(`需要确认（风险：${req.risk}）`));
@@ -300,7 +300,7 @@ function makeResolver(mode: PermissionMode) {
   };
 }
 
-function systemPrompt(workingDir: string, p: PermissionProfile): string {
+export function systemPrompt(workingDir: string, p: PermissionProfile): string {
   return [
     '你是一个运行在用户本地电脑上的 Agent。用户把一个工作目录交给你，你需要用工具真正完成任务，而不是只描述该怎么做。',
     '',
@@ -317,7 +317,7 @@ function systemPrompt(workingDir: string, p: PermissionProfile): string {
   ].join('\n');
 }
 
-function recordUsage(
+export function recordUsage(
   cfg: AppConfig,
   taskId: string,
   target: { providerId: string; modelId: string },

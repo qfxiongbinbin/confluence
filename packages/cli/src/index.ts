@@ -5,13 +5,14 @@ import { chatCommand, compareCommand, doctorCommand, taskCommand, usageCommand }
 import { mcpCommand } from './commands/mcp.js';
 import { providerCommand, flag } from './commands/provider.js';
 import { runCommand } from './commands/run.js';
+import { replCommand } from './tui/repl.js';
 import { c, err, heading, kv, line, table } from './ui.js';
 
 const VERSION = '0.1.0';
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
-  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') return help();
+  if (cmd === '--help' || cmd === '-h' || cmd === 'help') return help();
   if (cmd === '--version' || cmd === '-v') {
     line(`confluence ${VERSION}`);
     return 0;
@@ -19,6 +20,7 @@ async function main(argv: string[]): Promise<number> {
 
   const cfg = new AppConfig();
   try {
+    if (!cmd) return await replCommand(cfg);
     switch (cmd) {
       case 'provider':
         return await providerCommand(cfg, argv.slice(1));
