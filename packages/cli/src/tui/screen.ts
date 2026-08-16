@@ -1,19 +1,33 @@
 import type { TermSize } from './term.js';
+import {
+  BOLD,
+  CONTINUATION,
+  FG,
+  GUTTER_WIDTH,
+  LINE_STYLES,
+  RESET,
+  charWidth,
+  paint,
+  renderLine,
+  stringWidth,
+  truncateToWidth,
+  unitsOf,
+  type LineKind,
+} from './theme.js';
+import { renderStatusBar, type StatusBar } from './statusbar.js';
 
-export interface StatusBar {
-  model: string;
-  tokensIn: number;
-  tokensOut: number;
-  costCny: number;
-  mode: string;
-  running: boolean;
-}
-
-type LineKind = 'normal' | 'muted' | 'diff-add' | 'diff-del' | 'diff-meta';
+export type { StatusBar } from './statusbar.js';
+export { stringWidth } from './theme.js';
 
 interface OutputLine {
   text: string;
   kind: LineKind;
+  /** 软换行的续行：不重复装订线符号，只保留缩进。 */
+  continuation?: boolean;
+  /** 已渲染完毕的行（横幅等）：跳过 clean 与装订线，原样显示。 */
+  raw?: boolean;
+  /** 右侧灰色尾注（如耗时），渲染时拼接。 */
+  meta?: string;
 }
 
 export interface PickerState {
@@ -28,20 +42,8 @@ export interface HintState {
 }
 
 const MAX_OUTPUT_LINES = 2_000;
-const RESET = '\u001b[0m';
-const GRAY = '\u001b[90m';
-const CYAN = '\u001b[36m';
-const GREEN = '\u001b[32m';
-const RED = '\u001b[31m';
-const BOLD = '\u001b[1m';
-
-const KIND_COLORS: Record<LineKind, string> = {
-  normal: '',
-  muted: GRAY,
-  'diff-add': GREEN,
-  'diff-del': RED,
-  'diff-meta': CYAN,
-};
+const GRAY = FG.gray;
+const CYAN = FG.cyan;
 
 export class Screen {
   private terminalSize: TermSize;
@@ -60,9 +62,14 @@ export class Screen {
   private picker?: PickerState;
   /** 命令提示（输入以 / 开头时出现）。undefined 表示未显示。 */
   private hints?: HintState;
+  /** 通用浮层（权限确认抽屉等）。优先级高于 picker / hints。 */
+  private overlay?: string[];
+  /** 输入行提示语；reasonMode 等场景会换掉默认的「> 」。 */
+  private inputPrompt: string;
 
   constructor(size: TermSize) {
     this.terminalSize = size;
+    this.inputPrompt = `${paint(CYAN, '>')} `;
   }
 
   setPicker(picker: PickerState | undefined): void {
@@ -71,6 +78,14 @@ export class Screen {
 
   setHints(hints: HintState | undefined): void {
     this.hints = hints;
+  }
+
+  setOverlay(lines: string[] | undefined): void {
+    this.overlay = lines;
+  }
+
+  setInputPrompt(prompt: string): void {
+    this.inputPrompt = prompt;
   }
 
   resize(size: TermSize): void {
@@ -83,6 +98,24 @@ export class Screen {
 
   pushMutedLine(text: string): void {
     this.push([{ text: clean(text), kind: 'muted' }]);
+  }
+
+  /** 按行类型推送：装订线符号与配色由 theme 决定，调用方不再手拼前缀。 */
+  pushKind(kind: LineKind, text: string, meta?: string): void {
+    const parts = clean(text).split('\n');
+    this.push(
+      parts.map((text, index) => ({
+        text,
+        kind,
+        ...(index === parts.length - 1 && meta ? { meta } : {}),
+      })),
+    );
+  }
+
+  /** 推入已渲染好的行（横幅等）：跳过 clean 与装订线，保留原有 ANSI。 */
+  pushRaw(text: string): void {
+    this.output.push(...text.split('\n').map((line) => ({ text: line, kind: 'normal' as const, raw: true })));
+    this.trimOutput();
   }
 
   /** 渲染引擎产出的 unified diff：+绿 -红、文件头青色加粗。 */
@@ -99,17 +132,32 @@ export class Screen {
     this.push(lines);
   }
 
-  appendToLast(text: string): void {
+  appendToLast(text: string, kind: LineKind = 'normal'): void {
     const parts = clean(text).split('\n');
-    if (this.output.length === 0 || this.output[this.output.length - 1]!.kind !== 'normal') {
-      this.output.push({ text: '', kind: 'normal' });
+    const last = this.output[this.output.length - 1];
+    if (!last || last.kind !== kind || last.raw) {
+      this.output.push({ text: '', kind });
     }
     this.output[this.output.length - 1]!.text += parts[0]!;
     if (parts.length > 1) {
-      this.push(parts.slice(1).map((line) => ({ text: line, kind: 'normal' as const })));
+      this.push(parts.slice(1).map((line) => ({ text: line, kind })));
       return;
     }
     this.trimOutput();
+  }
+
+  /** 原地替换最后一行（限流倒计时等每秒刷新的行，不新增行数）。 */
+  replaceLast(text: string, kind: LineKind = 'muted'): void {
+    const last = this.output[this.output.length - 1];
+    if (!last) {
+      this.push([{ text: clean(text), kind }]);
+      return;
+    }
+    last.text = clean(text);
+    last.kind = kind;
+    last.meta = undefined;
+    last.continuation = false;
+    last.raw = false;
   }
 
   clear(): void {
@@ -140,9 +188,13 @@ export class Screen {
     const inputRows = this.wrapInputTail(input, cursorOffset);
     let outputRows = Math.max(0, this.terminalSize.rows - inputRows.rows.length - 2);
 
-    // —— 选择器/命令提示浮层：占输出区底部若干行 ——
+    // —— 浮层：抽屉 > 选择器 > 命令提示，占输出区底部若干行 ——
     const overlayLines: string[] = [];
-    if (this.picker) {
+    if (this.overlay) {
+      // 抽屉行数封顶为输出区一半：窄终端下也不把已有输出完全挤没
+      const cap = Math.max(3, Math.floor(outputRows / 2));
+      overlayLines.push(...this.overlay.slice(-cap));
+    } else if (this.picker) {
       const maxItems = Math.max(0, outputRows - 1);
       const from = Math.max(0, Math.min(this.picker.index - Math.floor(maxItems / 2), this.picker.items.length - maxItems));
       const visible = this.picker.items.slice(from, from + maxItems);
@@ -184,19 +236,26 @@ export class Screen {
     // 每行末尾擦到行尾（EL）：外界往终端写的东西（stderr 警告、进度条…）
     // 以及上一次更长的行，都会在下一次重绘时被彻底清掉，不会叠在输入区后面。
     rows.push(`${GRAY}${'─'.repeat(Math.max(1, this.terminalSize.cols))}${RESET}`);
-    inputRows.rows.forEach((line, index) => rows.push(`${index === 0 ? `${CYAN}>${RESET} ` : '  '}${line}`));
-    rows.push(`${GRAY}${truncateToWidth(this.statusText(), this.terminalSize.cols)}${RESET}`);
+    const promptWidth = stringWidth(this.inputPrompt);
+    const promptPad = ' '.repeat(promptWidth);
+    inputRows.rows.forEach((line, index) => rows.push(`${index === 0 ? this.inputPrompt : promptPad}${line}`));
+    rows.push(
+      renderStatusBar(
+        { ...this.status, ...(this.scrollOffset > 0 ? { scrolled: this.scrollOffset } : {}) },
+        this.terminalSize.cols,
+      ),
+    );
     const body = rows.map((row) => `${row}\u001b[K`).join('\n');
 
     const cursorRow = outputRows + 2 + inputRows.cursorRow;
     // 光标列必须按「显示宽度」算：中文等宽字符占 2 列，按码点数会导致光标左偏
-    const cursorColumn = 3 + inputRows.cursorWidth;
+    const cursorColumn = promptWidth + 1 + inputRows.cursorWidth;
 
     return `\u001b[H${body}\u001b[J\u001b[${cursorRow};${cursorColumn}H`;
   }
 
   /**
-   * 把输入的尾部若干逻辑行软换行为显示行（每行预留 2 列前缀），
+   * 把输入的尾部若干逻辑行软换行为显示行（每行预留提示语宽度），
    * 同时算出光标落在第几个显示行、行内第几列（显示宽度）。
    */
   private wrapInputTail(input: string, cursorOffset: number): { rows: string[]; cursorRow: number; cursorWidth: number } {
@@ -261,12 +320,6 @@ export class Screen {
     return Math.max(0, displayLines - outputRows);
   }
 
-  private statusText(): string {
-    const running = this.status.running ? ' · 运行中…' : '';
-    const scrolled = this.scrollOffset > 0 ? ` · ↑${this.scrollOffset} 行` : '';
-    return `${this.status.model} · in ${fmtTokens(this.status.tokensIn)} out ${fmtTokens(this.status.tokensOut)} · ${money(this.status.costCny)}${scrolled}${running}`;
-  }
-
   private push(lines: OutputLine[]): void {
     this.output.push(...lines);
     this.trimOutput();
@@ -280,10 +333,12 @@ export class Screen {
 }
 
 function colorize(line: OutputLine): string {
-  const color = KIND_COLORS[line.kind];
-  if (!color) return line.text;
-  if (line.kind === 'diff-meta') return `${BOLD}${color}${line.text}${RESET}`;
-  return `${color}${line.text}${RESET}`;
+  if (line.raw) return line.text;
+  if (line.continuation) {
+    const style = LINE_STYLES[line.kind];
+    return `${CONTINUATION}${paint(style.textCodes, line.text)}`;
+  }
+  return renderLine(line.kind, line.text, line.meta);
 }
 
 /** 从存储行尾部向前软换行，累计拿到 enough 行即停，避免每帧折断全部 2000 行 */
@@ -292,7 +347,7 @@ function wrapTail(lines: OutputLine[], enough: number, cols: number): OutputLine
   for (let index = lines.length - 1; index >= 0 && wrapped.length < enough; index--) {
     // 对话文本在换行前先做内联 Markdown → ANSI，避免标记被折行拆开
     const line = lines[index]!;
-    const source = line.kind === 'normal' ? { ...line, text: mdToAnsi(line.text) } : line;
+    const source = line.kind === 'normal' && !line.raw ? { ...line, text: mdToAnsi(line.text) } : line;
     wrapped.unshift(...wrapLine(source, cols));
   }
   return wrapped;
@@ -318,90 +373,34 @@ export function mdToAnsi(text: string): string {
   return out.replace(/\u0000(\d+)\u0000/g, (_, i: string) => codeSpans[Number(i)] ?? '');
 }
 
-interface DisplayUnit {
-  text: string;
-  width: number;
-}
-
-/** 把文本拆成「显示单元」：ANSI 转义序列是一个 0 宽单元，其余按码点计宽。 */
-function unitsOf(text: string): DisplayUnit[] {
-  const units: DisplayUnit[] = [];
-  const re = /(\u001b\[[0-9;?]*[A-Za-z]|[\s\S])/gu;
-  for (const match of text.matchAll(re)) {
-    const unit = match[1]!;
-    units.push(unit.startsWith('\u001b') ? { text: unit, width: 0 } : { text: unit, width: charWidth(unit.codePointAt(0)!) });
-  }
-  return units;
-}
-
 function wrapLine(line: OutputLine, cols: number): OutputLine[] {
-  if (cols <= 0) return [line];
+  // 正文可用宽度要扣掉装订线，续行再补 CONTINUATION 缩进，折回来不会顶到第 1 列
+  const avail = cols - GUTTER_WIDTH;
+  if (cols <= 0 || avail <= 0) return [line];
   const units = unitsOf(line.text);
   const segments: OutputLine[] = [];
   let current: string[] = [];
   let width = 0;
+  let first = true;
   for (const unit of units) {
-    if (width + unit.width > cols) {
-      segments.push({ text: current.join(''), kind: line.kind });
+    if (width + unit.width > avail) {
+      segments.push({ text: current.join(''), kind: line.kind, continuation: !first, raw: line.raw, meta: line.meta });
       current = [];
       width = 0;
+      first = false;
     }
     current.push(unit.text);
     width += unit.width;
   }
-  segments.push({ text: current.join(''), kind: line.kind });
+  segments.push({ text: current.join(''), kind: line.kind, continuation: !first, raw: line.raw, meta: line.meta });
   return segments;
 }
 
 function wrappedLineCount(line: OutputLine, cols: number): number {
+  const avail = cols - GUTTER_WIDTH;
   const width = stringWidth(line.text);
-  if (cols <= 0 || width <= cols) return 1;
-  return Math.ceil(width / cols);
-}
-
-/** 零依赖的显示宽度估算：East Asian Wide/Fullwidth 与常见 emoji 记 2 列；ANSI 转义 0 列 */
-export function stringWidth(text: string): number {
-  let width = 0;
-  for (const unit of unitsOf(text)) width += unit.width;
-  return width;
-}
-
-function charWidth(codePoint: number): number {
-  if (codePoint === 0xfe0f || codePoint === 0x200d) return 0; // variation selector / ZWJ
-  if (codePoint >= 0x0300 && codePoint <= 0x036f) return 0; // 组合记号（简化处理）
-  if (
-    (codePoint >= 0x1100 && codePoint <= 0x115f) || // Hangul Jamo
-    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) || // CJK 部首、注音、康熙……
-    (codePoint >= 0xa960 && codePoint <= 0xa97f) ||
-    (codePoint >= 0xac00 && codePoint <= 0xd7a3) || // Hangul 音节
-    (codePoint >= 0xf900 && codePoint <= 0xfaff) || // CJK 兼容表意
-    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
-    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
-    (codePoint >= 0xff00 && codePoint <= 0xff60) || // 全角形式
-    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-    (codePoint >= 0x16fe0 && codePoint <= 0x16fe4) ||
-    (codePoint >= 0x17000 && codePoint <= 0x18aff) ||
-    (codePoint >= 0x1f300 && codePoint <= 0x1f64f) || // 常见 emoji
-    (codePoint >= 0x1f680 && codePoint <= 0x1f6ff) ||
-    (codePoint >= 0x1f900 && codePoint <= 0x1faff) ||
-    (codePoint >= 0x20000 && codePoint <= 0x3fffd) // CJK 扩展 B+
-  ) {
-    return 2;
-  }
-  return 1;
-}
-
-/** 按显示宽度截断文本（宽字符不拆半、ANSI 0 宽），供状态栏防溢出 */
-function truncateToWidth(text: string, maxWidth: number): string {
-  if (maxWidth <= 0) return '';
-  let width = 0;
-  const kept: string[] = [];
-  for (const unit of unitsOf(text)) {
-    if (width + unit.width > maxWidth) break;
-    kept.push(unit.text);
-    width += unit.width;
-  }
-  return kept.join('');
+  if (cols <= 0 || avail <= 0 || width <= avail) return 1;
+  return Math.ceil(width / avail);
 }
 
 function clean(text: string): string {
@@ -409,16 +408,4 @@ function clean(text: string): string {
     .replace(/\r\n?/g, '\n')
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
-}
-
-function fmtTokens(tokens: number): string {
-  if (tokens < 1_000) return String(tokens);
-  if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k`;
-  return `${(tokens / 1_000_000).toFixed(1)}m`;
-}
-
-function money(costCny: number): string {
-  if (costCny === 0) return '¥0';
-  if (costCny < 0.01) return `¥${costCny.toFixed(5)}`;
-  return `¥${costCny.toFixed(4)}`;
 }
