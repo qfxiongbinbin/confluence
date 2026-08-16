@@ -45,6 +45,16 @@ export interface ProviderConfig {
   extraHeaders?: Record<string, string>;
 }
 
+/** Emitted right before a retryable failure goes to sleep, so the UI can show a countdown. */
+export interface RetryNotice {
+  providerId: string;
+  /** 1-based: the attempt that is about to happen. */
+  attempt: number;
+  maxRetries: number;
+  waitMs: number;
+  code: string;
+}
+
 export interface ClientOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -52,6 +62,7 @@ export interface ClientOptions {
   /** Injected for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
   onWarning?: (message: string) => void;
+  onRetry?: (notice: RetryNotice) => void;
 }
 
 const ADAPTERS: Record<WireProtocol, ProtocolAdapter> = {
@@ -61,7 +72,10 @@ const ADAPTERS: Record<WireProtocol, ProtocolAdapter> = {
 };
 
 export class ModelClient {
-  private readonly opts: Required<Omit<ClientOptions, 'onWarning'>> & { onWarning?: (m: string) => void };
+  private readonly opts: Required<Omit<ClientOptions, 'onWarning' | 'onRetry'>> & {
+    onWarning?: (m: string) => void;
+    onRetry?: (n: RetryNotice) => void;
+  };
   /** In-flight request count per provider, for concurrency-metered providers. */
   private inflight = new Map<string, number>();
   private warned = new Set<string>();
@@ -76,6 +90,7 @@ export class ModelClient {
       maxRetries: options.maxRetries ?? 4,
       sleep: options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+      ...(options.onRetry ? { onRetry: options.onRetry } : {}),
     };
   }
 
@@ -149,7 +164,15 @@ export class ModelClient {
         }
         if (!err.retryable || attempt === this.opts.maxRetries) throw err;
 
-        await this.opts.sleep(this.backoffMs(provider.quirks, attempt, err));
+        const waitMs = this.backoffMs(provider.quirks, attempt, err);
+        this.opts.onRetry?.({
+          providerId: provider.id,
+          attempt: attempt + 1,
+          maxRetries: this.opts.maxRetries,
+          waitMs,
+          code: err.code,
+        });
+        await this.opts.sleep(waitMs);
       }
     }
     throw lastError ?? new EngineError('UNKNOWN', { detail: '重试耗尽' });
