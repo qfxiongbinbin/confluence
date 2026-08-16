@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Screen } from '../dist/tui/screen.js';
-import { BG, BOLD, FG, RESET, renderLine, setColorEnabled } from '../dist/tui/theme.js';
+import { BG, BOLD, FG, RESET, renderLine, setColorEnabled, stringWidth } from '../dist/tui/theme.js';
 import { ConfirmDrawer } from '../dist/tui/confirm.js';
 import { renderBanner } from '../dist/tui/banner.js';
 
@@ -212,17 +212,63 @@ test('抽屉浮层：优先级高于命令提示，输出区自动让位', () =>
   assert.match(screen.render('/mo', 3), /命令（Tab 补全/);
 });
 
-test('抽屉浮层：行数封顶为输出区一半，窄终端不把输出挤没', () => {
-  const screen = new Screen({ cols: 40, rows: 10 });
+test('抽屉浮层：优先整块显示，窄终端也至少给上文留 2 行', () => {
+  // 抽屉自带边框，从头截会连上边框和标题一起丢掉 —— 宁可把上文顶上去。
+  const screen = new Screen({ cols: 40, rows: 24 });
   screen.setStatus(status);
   screen.pushLine('kept-output');
   screen.setOverlay(Array.from({ length: 12 }, (_, i) => `overlay-${i}`));
   const rendered = screen.render('', 0);
+  assert.match(rendered, /overlay-0/); // 上边框那一行必须在
+  assert.match(rendered, /overlay-11/);
   assert.match(rendered, /kept-output/);
-  const shown = (rendered.match(/overlay-\d+/g) ?? []).length;
-  assert.ok(shown <= 4, `浮层行数 ${shown} 应不超过输出区高度的一半`);
-  screen.setOverlay(undefined);
-  assert.doesNotMatch(screen.render('', 0), /overlay-/);
+
+  // 真放不下时才截，且上文至少还剩 2 行
+  const tiny = new Screen({ cols: 40, rows: 10 });
+  tiny.setStatus(status);
+  tiny.pushLine('kept-output');
+  tiny.setOverlay(Array.from({ length: 12 }, (_, i) => `overlay-${i}`));
+  const tinyRendered = tiny.render('', 0);
+  const shown = (tinyRendered.match(/overlay-\d+/g) ?? []).length;
+  assert.equal(shown, 5, `浮层行数 ${shown} 应为输出区高度 7 - 2`);
+  assert.match(tinyRendered, /kept-output/);
+
+  tiny.setOverlay(undefined);
+  assert.doesNotMatch(tiny.render('', 0), /overlay-/);
+});
+
+test('ConfirmDrawer：盒子四边等宽铺满终端，边框色跟随风险等级', () => {
+  const drawer = new ConfirmDrawer('/repo');
+  drawer.show({
+    id: 'p5',
+    toolName: 'run_command',
+    args: {},
+    risk: 'critical',
+    summary: 'run_command · git commit',
+    affects: ['$ git commit -m x'],
+  });
+  for (const cols of [48, 80, 140]) {
+    const lines = drawer.render(cols);
+    for (const line of lines) assert.equal(stringWidth(line), cols, `每一行都应恰好 ${cols} 列`);
+    // 细线边框，颜色跟随风险等级（critical = 红）
+    assert.equal(lines[0], `${FG.red}┌${'─'.repeat(cols - 2)}┐${RESET}`, 'critical 的上边框应是红色细线');
+    assert.equal(lines.at(-1), `${FG.red}└${'─'.repeat(cols - 2)}┘${RESET}`, '下边框与上边框同色同材质');
+    for (const line of lines.slice(1, -1)) {
+      assert.ok(line.startsWith(`${FG.red}│${RESET} `), '左竖边应是红色细线');
+      assert.ok(line.endsWith(` ${FG.red}│${RESET}`), '右竖边应是红色细线');
+    }
+    assert.doesNotMatch(lines.join('\n'), /\[48;5;(28|136|124)m/, '不再使用底色块边框');
+  }
+});
+
+test('ConfirmDrawer：作用域后缀区分工作目录内外', () => {
+  const inside = new ConfirmDrawer('/repo');
+  inside.show({ id: 'a', toolName: 'write_file', args: {}, risk: 'medium', summary: '写入', affects: ['/repo/docs/a.md'] });
+  assert.ok(inside.render(80).join('\n').includes('工作目录内'));
+
+  const outside = new ConfirmDrawer('/repo');
+  outside.show({ id: 'b', toolName: 'write_file', args: {}, risk: 'medium', summary: '写入', affects: ['/etc/hosts'] });
+  assert.ok(outside.render(80).join('\n').includes('工作目录外'));
 });
 
 test('内联 Markdown：加粗渲染为 ANSI bold', () => {

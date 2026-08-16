@@ -35,6 +35,9 @@ let colorEnabled = true;
 export function setColorEnabled(enabled: boolean): void {
   colorEnabled = enabled;
 }
+export function colorsEnabled(): boolean {
+  return colorEnabled;
+}
 export function paint(codes: string, text: string): string {
   return colorEnabled && codes ? `${codes}${text}${RESET}` : text;
 }

@@ -191,8 +191,10 @@ export class Screen {
     // —— 浮层：抽屉 > 选择器 > 命令提示，占输出区底部若干行 ——
     const overlayLines: string[] = [];
     if (this.overlay) {
-      // 抽屉行数封顶为输出区一半：窄终端下也不把已有输出完全挤没
-      const cap = Math.max(3, Math.floor(outputRows / 2));
+      // 抽屉是「在等你」的焦点，且它自带边框：从头截会连上边框和标题一起丢掉，
+      // 看起来就是个断开的框。所以宁可把上文顶上去，也要让它整块显示 ——
+      // 只在输出区实在放不下时才截，且至少给上文留 2 行。
+      const cap = Math.max(3, outputRows - 2);
       overlayLines.push(...this.overlay.slice(-cap));
     } else if (this.picker) {
       const maxItems = Math.max(0, outputRows - 1);
@@ -245,9 +247,17 @@ export class Screen {
         this.terminalSize.cols,
       ),
     );
-    const body = rows.map((row) => `${row}\u001b[K`).join('\n');
+    // 每行末尾擦到行尾（EL）。但铺满整宽的行不能擦：写满最后一列后光标停在
+    // 最后一列（pending wrap），此时 EL 是「从光标位置起」擦，会把刚写进去的
+    // 最后一格一并抹掉 —— 抽屉的右边框就是这么消失的。铺满的行本来也没有
+    // 残留可擦，直接跳过。
+    const body = rows
+      .map((row) => (stringWidth(row) >= this.terminalSize.cols ? row : `${row}\u001b[K`))
+      .join('\n');
 
-    const cursorRow = outputRows + 2 + inputRows.cursorRow;
+    // 浮层（抽屉/选择器/命令提示）占输出区底部若干行，输入行整体下移；
+    // 光标行必须把这些行算进去，否则光标会落在浮层中间（曾表现为抽屉里出现光标块）
+    const cursorRow = outputRows + overlayLines.length + 2 + inputRows.cursorRow;
     // 光标列必须按「显示宽度」算：中文等宽字符占 2 列，按码点数会导致光标左偏
     const cursorColumn = promptWidth + 1 + inputRows.cursorWidth;
 

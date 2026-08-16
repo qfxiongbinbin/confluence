@@ -217,7 +217,8 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
   };
 
   // —— 权限确认抽屉：不退 raw mode、不清屏，浮层让位、上文不丢 ——
-  const drawer = new ConfirmDrawer();
+  // workingDir 传进去，抽屉才能在风险标签后缀里区分「工作目录内 / 外」
+  const drawer = new ConfirmDrawer(workingDir);
   let pendingPermission: ((answer: PermissionAnswer) => void) | undefined;
   let reasonMode = false;
   const defaultPrompt = () => `${paint(FG.cyan, '>')} `;
