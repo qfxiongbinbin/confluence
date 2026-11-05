@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Screen } from '../dist/tui/screen.js';
+import { BG, BOLD, FG, RESET, renderLine, setColorEnabled, stringWidth } from '../dist/tui/theme.js';
+import { ConfirmDrawer } from '../dist/tui/confirm.js';
+import { renderBanner } from '../dist/tui/banner.js';
+
+/** 把含 ANSI 常量的字面量转成正则（转义所有正则元字符）。 */
+const re = (s) => new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 
 const status = {
   model: 'deepseek/deepseek-chat',
@@ -36,9 +42,9 @@ test('render 包含输入框和状态栏', () => {
   const rendered = screen.render('整理文件', 4);
   assert.match(rendered, />\u001b\[0m 整理文件/);
   assert.match(rendered, /deepseek\/deepseek-chat/);
-  assert.match(rendered, /in 1\.2k out 34/);
+  assert.match(rendered, /in 1\.2k\s+out 34/);
   assert.match(rendered, /¥0\.0123/);
-  assert.match(rendered, /运行中…/);
+  assert.match(rendered, /● 运行中/);
 });
 
 test('resize 后按新高度重新截断输出', () => {
@@ -52,13 +58,14 @@ test('resize 后按新高度重新截断输出', () => {
   assert.match(rendered, /item-6/);
 });
 
-test('软换行：超宽输出行按终端宽度折行，不破坏布局', () => {
+test('软换行：超宽输出行按终端宽度折行，续行缩进对齐装订线', () => {
   const screen = new Screen({ cols: 10, rows: 8 });
   screen.setStatus(status);
   screen.pushLine('0123456789ABCDEFG');
   const rendered = screen.render('', 0);
   const body = rendered.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
-  assert.ok(body.includes('0123456789\nABCDEFG'), '长行应按显示宽度折为多行');
+  // 可用宽度 = 10 - 装订线 2 列，续行前补 2 列缩进，不顶到第 1 列
+  assert.ok(body.includes('01234567\n  89ABCDEF'), '长行应折为多行且续行带缩进');
 });
 
 test('光标列按显示宽度计算：中文不左偏', () => {
@@ -96,15 +103,34 @@ test('每行重绘都擦到行尾，stderr 残留不会叠在新内容后', () =
   assert.match(rendered, />\u001b\[0m 输入\u001b\[K/);
 });
 
-test('pushDiff：+ 行绿色、- 行红色、文件头青色加粗', () => {
+test('pushKind：装订线符号由行类型决定，尾注灰色拼接', () => {
+  const screen = new Screen({ cols: 80, rows: 12 });
+  screen.setStatus(status);
+  screen.pushKind('ok', '写入完成', '(120ms)');
+  const rendered = screen.render('', 0);
+  assert.match(rendered, re(`\u001b[32m✓\u001b[0m \u001b[32m写入完成\u001b[0m \u001b[90m(120ms)\u001b[0m`));
+});
+
+test('replaceLast：原地刷新最后一行，不新增行数', () => {
+  const screen = new Screen({ cols: 80, rows: 12 });
+  screen.setStatus(status);
+  screen.pushKind('muted', '3s 后继续');
+  screen.replaceLast('2s 后继续', 'muted');
+  screen.replaceLast('1s 后继续', 'muted');
+  const rendered = screen.render('', 0);
+  assert.match(rendered, /1s 后继续/);
+  assert.doesNotMatch(rendered, /3s 后继续/);
+});
+
+test('pushDiff：+ 行绿底、- 行红底、文件头青色加粗', () => {
   const screen = new Screen({ cols: 80, rows: 24 });
   screen.setStatus(status);
   screen.pushDiff('--- a/foo.ts\n+++ b/foo.ts\n-old line\n+new 中文行\n… (diff 已截断)');
   const rendered = screen.render('', 0);
-  assert.match(rendered, /\u001b\[1m\u001b\[36m--- a\/foo\.ts\u001b\[0m/);
-  assert.match(rendered, /\u001b\[31m-old line\u001b\[0m/);
-  assert.match(rendered, /\u001b\[32m\+new 中文行\u001b\[0m/);
-  assert.match(rendered, /\u001b\[90m… \(diff 已截断\)\u001b\[0m/);
+  assert.match(rendered, re(`${BOLD}${FG.cyan}--- a/foo.ts${RESET}`));
+  assert.match(rendered, re(`${FG.red}${BG.delSoft}-old line${RESET}`));
+  assert.match(rendered, re(`${FG.green}${BG.addSoft}+new 中文行${RESET}`));
+  assert.match(rendered, re(`${FG.gray}… (diff 已截断)${RESET}`));
 });
 
 test('pushDiff：长 diff 行软换行后仍保持各自颜色', () => {
@@ -112,8 +138,8 @@ test('pushDiff：长 diff 行软换行后仍保持各自颜色', () => {
   screen.setStatus(status);
   screen.pushDiff('+aaaaaaaaaa+bbbbbbbbbb');
   const rendered = screen.render('', 0);
-  // 折成两段，两段都是绿色
-  const greens = rendered.match(/\u001b\[32m[^\u001b]*\u001b\[0m/g) ?? [];
+  // 折成两段，两段都是绿色（前景+行底色）
+  const greens = rendered.match(new RegExp(`${re(FG.green + BG.addSoft).source}[^\\u001b]*${re(RESET).source}`, 'g')) ?? [];
   assert.ok(greens.length >= 2, `期望折行后仍有 2 段绿色，实际 ${greens.length}`);
 });
 
@@ -172,6 +198,77 @@ test('选择器：条目多于可用行时窗口滚动，选中项始终可见',
   assert.match(screen.render('', 0), /❯ model-0/);
   assert.doesNotMatch(screen.render('', 0), /model-19/);
   screen.setPicker(undefined);
+});
+
+test('抽屉浮层：优先级高于命令提示，输出区自动让位', () => {
+  const screen = new Screen({ cols: 48, rows: 14 });
+  screen.setStatus(status);
+  screen.setHints({ items: ['/model — 选择/切换模型'], index: 0 });
+  screen.setOverlay(['⏸ 需要确认', '  README.md']);
+  const rendered = screen.render('/mo', 3);
+  assert.match(rendered, /⏸ 需要确认/);
+  assert.doesNotMatch(rendered, /命令（Tab 补全/); // 抽屉打开时不显示命令提示
+  screen.setOverlay(undefined);
+  assert.match(screen.render('/mo', 3), /命令（Tab 补全/);
+});
+
+test('抽屉浮层：优先整块显示，窄终端也至少给上文留 2 行', () => {
+  // 抽屉自带边框，从头截会连上边框和标题一起丢掉 —— 宁可把上文顶上去。
+  const screen = new Screen({ cols: 40, rows: 24 });
+  screen.setStatus(status);
+  screen.pushLine('kept-output');
+  screen.setOverlay(Array.from({ length: 12 }, (_, i) => `overlay-${i}`));
+  const rendered = screen.render('', 0);
+  assert.match(rendered, /overlay-0/); // 上边框那一行必须在
+  assert.match(rendered, /overlay-11/);
+  assert.match(rendered, /kept-output/);
+
+  // 真放不下时才截，且上文至少还剩 2 行
+  const tiny = new Screen({ cols: 40, rows: 10 });
+  tiny.setStatus(status);
+  tiny.pushLine('kept-output');
+  tiny.setOverlay(Array.from({ length: 12 }, (_, i) => `overlay-${i}`));
+  const tinyRendered = tiny.render('', 0);
+  const shown = (tinyRendered.match(/overlay-\d+/g) ?? []).length;
+  assert.equal(shown, 5, `浮层行数 ${shown} 应为输出区高度 7 - 2`);
+  assert.match(tinyRendered, /kept-output/);
+
+  tiny.setOverlay(undefined);
+  assert.doesNotMatch(tiny.render('', 0), /overlay-/);
+});
+
+test('ConfirmDrawer：盒子四边等宽铺满终端，边框色跟随风险等级', () => {
+  const drawer = new ConfirmDrawer('/repo');
+  drawer.show({
+    id: 'p5',
+    toolName: 'run_command',
+    args: {},
+    risk: 'critical',
+    summary: 'run_command · git commit',
+    affects: ['$ git commit -m x'],
+  });
+  for (const cols of [48, 80, 140]) {
+    const lines = drawer.render(cols);
+    for (const line of lines) assert.equal(stringWidth(line), cols, `每一行都应恰好 ${cols} 列`);
+    // 细线边框，颜色跟随风险等级（critical = 红）
+    assert.equal(lines[0], `${FG.red}┌${'─'.repeat(cols - 2)}┐${RESET}`, 'critical 的上边框应是红色细线');
+    assert.equal(lines.at(-1), `${FG.red}└${'─'.repeat(cols - 2)}┘${RESET}`, '下边框与上边框同色同材质');
+    for (const line of lines.slice(1, -1)) {
+      assert.ok(line.startsWith(`${FG.red}│${RESET} `), '左竖边应是红色细线');
+      assert.ok(line.endsWith(` ${FG.red}│${RESET}`), '右竖边应是红色细线');
+    }
+    assert.doesNotMatch(lines.join('\n'), /\[48;5;(28|136|124)m/, '不再使用底色块边框');
+  }
+});
+
+test('ConfirmDrawer：作用域后缀区分工作目录内外', () => {
+  const inside = new ConfirmDrawer('/repo');
+  inside.show({ id: 'a', toolName: 'write_file', args: {}, risk: 'medium', summary: '写入', affects: ['/repo/docs/a.md'] });
+  assert.ok(inside.render(80).join('\n').includes('工作目录内'));
+
+  const outside = new ConfirmDrawer('/repo');
+  outside.show({ id: 'b', toolName: 'write_file', args: {}, risk: 'medium', summary: '写入', affects: ['/etc/hosts'] });
+  assert.ok(outside.render(80).join('\n').includes('工作目录外'));
 });
 
 test('内联 Markdown：加粗渲染为 ANSI bold', () => {
@@ -239,4 +336,100 @@ test('命令提示：条目多时窗口滚动且选中项可见', () => {
   const rendered = screen.render('/cmd', 4);
   assert.match(rendered, /❯ \/cmd8/);
   assert.doesNotMatch(rendered, /\/cmd0 /);
+});
+
+test('状态栏：窄终端逐级降级，整行不超宽', async () => {
+  const { stringWidth } = await import('../dist/tui/screen.js');
+  for (const cols of [80, 48, 20]) {
+    const screen = new Screen({ cols, rows: 8 });
+    screen.setStatus({ ...status, running: true, elapsedSec: 7 });
+    const rendered = screen.render('', 0);
+    const plain = rendered.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
+    for (const line of plain.split('\n')) {
+      assert.ok(stringWidth(line) <= cols, `cols=${cols} 行宽超限："${line}" (${stringWidth(line)})`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------- theme ---
+
+test('renderLine：NO_COLOR 下只保留装订线符号', () => {
+  setColorEnabled(false);
+  assert.equal(renderLine('ok', 'x'), '✓ x');
+  assert.equal(renderLine('user', '任务'), '❯ 任务');
+  assert.equal(renderLine('error', '失败', '(404)'), '✗ 失败 (404)');
+  setColorEnabled(true);
+});
+
+// --------------------------------------------------------------- banner ---
+
+test('renderBanner：窄终端降级为单行', () => {
+  const lines = renderBanner({ version: '0.1.0', model: 'ds/chat', mode: 'smart', cwd: '~/p' }, 40);
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].includes('v0.1.0'));
+  assert.ok(lines[0].includes('ds/chat'));
+});
+
+test('renderBanner：宽终端输出多行完整横幅', () => {
+  const lines = renderBanner(
+    { version: '0.1.0', model: 'deepseek/deepseek-chat', mode: 'smart', cwd: '~/p', sandbox: 'seatbelt' },
+    80,
+  );
+  assert.ok(lines.length >= 5, `完整横幅应至少 5 行，实际 ${lines.length}`);
+  assert.ok(lines.join('\n').includes('seatbelt'));
+});
+
+// -------------------------------------------------------------- confirm ---
+
+test('ConfirmDrawer：数字 3 直选拒绝并收起', () => {
+  const drawer = new ConfirmDrawer();
+  drawer.show({
+    id: 'p1',
+    toolName: 'write_file',
+    args: {},
+    risk: 'medium',
+    summary: '写入 README.md',
+    affects: ['README.md'],
+  });
+  assert.equal(drawer.open, true);
+  const result = drawer.handleKey('3');
+  assert.deepEqual(result, { type: 'answer', answer: { decision: 'deny' } });
+  assert.equal(drawer.open, false);
+});
+
+test('ConfirmDrawer：Esc 等同拒绝，Enter 选当前项', () => {
+  const drawer = new ConfirmDrawer();
+  drawer.show({
+    id: 'p2',
+    toolName: 'shell',
+    args: {},
+    risk: 'low',
+    summary: '执行 ls',
+    affects: [],
+  });
+  assert.deepEqual(drawer.handleKey('escape'), { type: 'answer', answer: { decision: 'deny' } });
+  drawer.show({
+    id: 'p3',
+    toolName: 'shell',
+    args: {},
+    risk: 'low',
+    summary: '执行 ls',
+    affects: [],
+  });
+  drawer.handleKey('down'); // 移到「本会话总是允许」
+  assert.deepEqual(drawer.handleKey('enter'), { type: 'answer', answer: { decision: 'allow_always' } });
+});
+
+test('ConfirmDrawer：第 4 项返回 ask_reason，由输入行收集原因', () => {
+  const drawer = new ConfirmDrawer();
+  drawer.show({
+    id: 'p4',
+    toolName: 'edit_file',
+    args: {},
+    risk: 'high',
+    summary: '批量改 5 个文件',
+    affects: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'],
+  });
+  assert.deepEqual(drawer.handleKey('4'), { type: 'ask_reason' });
+  assert.equal(drawer.open, false); // 抽屉已收起，等待输入行
 });

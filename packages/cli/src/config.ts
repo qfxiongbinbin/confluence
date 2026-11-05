@@ -15,6 +15,7 @@ import {
   resolveQuirks,
   type McpServerConfig,
   type ProviderConfig,
+  type RetryNotice,
   type SecretStore,
   type WireProtocol,
 } from '@confluence/core';
@@ -161,7 +162,9 @@ export class AppConfig {
   }
 
   /** Build a live ModelClient from the stored records + secrets. */
-  client(opts: { modelId?: string; onWarning?: (m: string) => void } = {}): ModelClient {
+  client(
+    opts: { modelId?: string; onWarning?: (m: string) => void; onRetry?: (n: RetryNotice) => void } = {},
+  ): ModelClient {
     const secrets = this.secrets();
     const map = new Map<string, ProviderConfig>();
     for (const r of this.providers) {
@@ -189,6 +192,7 @@ export class AppConfig {
     const proxy = this.settings().proxy;
     return new ModelClient(map, {
       ...(opts.onWarning ? { onWarning: opts.onWarning } : {}),
+      ...(opts.onRetry ? { onRetry: opts.onRetry } : {}),
       ...(proxy ? { fetchImpl: makeProxyFetch(proxy) } : {}),
     });
   }

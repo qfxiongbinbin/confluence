@@ -1,18 +1,22 @@
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import {
   AgentRunner,
+  KeychainSecretStore,
   PermissionEngine,
   ToolRegistry,
+  detectSandbox,
   loadMcpTools,
   type AgentEvent,
   type AgentRunOptions,
   type Message,
   type PermissionAnswer,
   type PermissionRequest,
+  type RetryNotice,
 } from '@confluence/core';
 import type { AppConfig } from '../config.js';
-import { confirm, err, prompt } from '../ui.js';
+import { err } from '../ui.js';
 import {
   buildProfile,
   loadProjectMcp,
@@ -21,9 +25,13 @@ import {
   recordUsage,
   systemPrompt,
 } from '../commands/run.js';
+import { renderBanner } from './banner.js';
+import { ConfirmDrawer } from './confirm.js';
 import { decodeKey, InputBuffer } from './input.js';
 import { Screen, type StatusBar } from './screen.js';
+import { FG, paint, setColorEnabled } from './theme.js';
 import { Term } from './term.js';
+import { VERSION } from '../version.js';
 
 const DOUBLE_CTRL_C_MS = 1_200;
 const PASTE_END = Buffer.from('\u001b[201~');
@@ -66,6 +74,8 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
   }
 
   const term = new Term();
+  // 符号先行、颜色其次：NO_COLOR / 非 TTY 下只保留装订线符号，内容类别仍可辨
+  setColorEnabled(process.stdout.isTTY === true && !process.env['NO_COLOR']);
   const input = new InputBuffer();
   const screen = new Screen(term.size());
   const workingDir = resolve(process.cwd());
@@ -95,10 +105,37 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
   // —— 命令提示 ——
   let hintsHidden = false; // 用户按 Esc 主动隐藏，直到输入再次变化
   let hintIndex = 0;
+  // —— 限流退避倒计时 / 运行耗时秒表 ——
+  let retryTimer: ReturnType<typeof setInterval> | undefined;
+  let tickTimer: ReturnType<typeof setInterval> | undefined;
+  let runStartedAt = 0;
   let resolveExit: (() => void) | undefined;
   const exitRequested = new Promise<void>((resolvePromise) => {
     resolveExit = resolvePromise;
   });
+
+  // —— 横幅信息 ——
+  const usableClient = cfg.client({ modelId: initialTarget.modelId });
+  const hasUsableProvider = usableClient.listProviders().length > 0;
+  const countSwitchableModels = (): number => {
+    let count = 0;
+    for (const record of cfg.listProviders()) {
+      if (!record.enabled || !usableClient.getProvider(record.id)) continue;
+      count += cfg.modelsFor(record.id).length;
+    }
+    return count;
+  };
+  const sandboxCapability = detectSandbox();
+  const sandboxKind: 'seatbelt' | 'bubblewrap' | undefined =
+    sandboxCapability.available &&
+    (sandboxCapability.backend === 'seatbelt' || sandboxCapability.backend === 'bubblewrap')
+      ? sandboxCapability.backend
+      : undefined;
+  const secretBackendLabel = (): string | undefined => {
+    const prefer = cfg.settings().secretBackend;
+    if (prefer) return prefer;
+    return KeychainSecretStore.available() ? 'keychain（自动）' : 'env 兜底';
+  };
 
   const status = (): StatusBar => ({
     model: `${target.providerId}/${target.modelId}`,
@@ -107,6 +144,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     costCny: cumulativeCost + runCost,
     mode: profile.mode,
     running: activeController !== undefined,
+    elapsedSec: activeController && runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : undefined,
   });
 
   /** 输入以 / 开头且单行时，列出前缀匹配的命令；否则关闭提示。 */
@@ -142,6 +180,13 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     if (exiting) return;
     exiting = true;
     exitCode = code;
+    if (drawer.open) drawer.close();
+    if (pendingPermission || reasonMode) {
+      reasonMode = false;
+      settlePermission({ decision: 'deny' });
+    }
+    clearRetryTimer();
+    clearTickTimer();
     activeController?.abort();
     resolveExit?.();
   };
@@ -171,33 +216,57 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     inputAttached = true;
   };
 
-  const permissionResolver = async (request: PermissionRequest): Promise<PermissionAnswer> => {
-    detachInput();
-    term.exitRawMode();
-    rawModeEntered = false;
-    term.showCursor();
-    term.write('\u001b[H\u001b[J');
-    let answer: string;
-    try {
-      answer = await confirm(`需要确认（风险：${request.risk}）\n${request.summary}\n${request.affects.map((item) => `  ${item}`).join('\n')}\n如何处理？`, [
-        { key: 'y', label: '允许这一次' },
-        { key: 'a', label: '本次会话内始终允许同类操作' },
-        { key: 'n', label: '拒绝' },
-        { key: 'r', label: '拒绝并说明原因' },
-      ]);
-      if (answer === 'y') return { decision: 'allow' };
-      if (answer === 'a') return { decision: 'allow_always' };
-      if (answer === 'n') return { decision: 'deny' };
-      const reason = await prompt('原因：');
-      return { decision: 'deny', reason };
-    } finally {
-      if (!exiting) {
-        term.enterRawMode();
-        rawModeEntered = true;
-        attachInput();
-        redraw();
-      }
+  // —— 权限确认抽屉：不退 raw mode、不清屏，浮层让位、上文不丢 ——
+  // workingDir 传进去，抽屉才能在风险标签后缀里区分「工作目录内 / 外」
+  const drawer = new ConfirmDrawer(workingDir);
+  let pendingPermission: ((answer: PermissionAnswer) => void) | undefined;
+  let reasonMode = false;
+  const defaultPrompt = () => `${paint(FG.cyan, '>')} `;
+
+  const settlePermission = (answer: PermissionAnswer) => {
+    screen.setOverlay(undefined);
+    screen.setInputPrompt(defaultPrompt());
+    pendingPermission?.(answer);
+    pendingPermission = undefined;
+  };
+
+  const permissionResolver = (request: PermissionRequest): Promise<PermissionAnswer> =>
+    new Promise<PermissionAnswer>((resolve) => {
+      pendingPermission = resolve;
+      reasonMode = false;
+      drawer.show(request, request.affects.length > 3);
+      screen.setOverlay(drawer.render(term.size().cols));
+      redraw();
+    });
+
+  // —— 限流退避：第二行倒计时每秒原地刷新，不逐秒新增行 ——
+  const clearRetryTimer = () => {
+    if (retryTimer) {
+      clearInterval(retryTimer);
+      retryTimer = undefined;
     }
+  };
+
+  const clearTickTimer = () => {
+    if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = undefined;
+    }
+  };
+
+  const showRetryCountdown = (notice: RetryNotice) => {
+    clearRetryTimer();
+    const total = Math.max(1, Math.ceil(notice.waitMs / 1000));
+    screen.pushKind('warn', `限流 ${notice.code} · ${notice.providerId}`);
+    screen.pushKind('muted', `第 ${notice.attempt} 次重试，${total}s 后继续  ^C 放弃`);
+    const deadline = Date.now() + notice.waitMs;
+    retryTimer = setInterval(() => {
+      const remain = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      screen.replaceLast(`第 ${notice.attempt} 次重试，${remain}s 后继续  ^C 放弃`, 'muted');
+      redraw();
+      if (remain <= 0) clearRetryTimer();
+    }, 1_000);
+    redraw();
   };
 
   const runTurn = async (goal: string): Promise<void> => {
@@ -207,7 +276,11 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     runTokensIn = 0;
     runTokensOut = 0;
     runCost = 0;
-    screen.pushLine(`❯ ${goal}`);
+    runStartedAt = Date.now();
+    clearRetryTimer();
+    // 运行期间每秒重绘一次：状态栏的耗时秒数才能走起来
+    if (!tickTimer) tickTimer = setInterval(() => redraw(), 1_000);
+    screen.pushKind('user', goal);
     redraw();
 
     cfg.store.createTask({
@@ -232,9 +305,10 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     const client = cfg.client({
       modelId: turnTarget.modelId,
       onWarning: (message) => {
-        screen.pushLine(`! ${message}`);
+        screen.pushKind('warn', message);
         redraw();
       },
+      onRetry: showRetryCountdown,
     });
     const runner = new AgentRunner(client, tools, permissions, cfg.prices, permissionResolver);
     const options: AgentRunOptions = {
@@ -272,7 +346,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
           },
           onReasoning: () => {
             if (reasoningShown) return;
-            screen.pushMutedLine('[思考…]');
+            screen.pushKind('reasoning', '思考中…');
             reasoningShown = true;
           },
           onText: (text) => {
@@ -307,13 +381,16 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       });
       recordUsage(cfg, taskId, turnTarget, result);
 
-      if (result.stopReason === 'aborted') screen.pushLine('! 已中断');
-      else if (result.error) screen.pushLine(`✗ ${result.error.userMessage}`);
+      if (result.stopReason === 'aborted') screen.pushKind('warn', '已中断');
+      else if (result.error) screen.pushKind('error', result.error.userMessage);
     } catch (error) {
-      screen.pushLine(`✗ 运行失败：${error instanceof Error ? error.message : String(error)}`);
+      screen.pushKind('error', `运行失败：${error instanceof Error ? error.message : String(error)}`);
       cfg.store.updateTask(taskId, { status: 'failed', stopReason: 'error' });
     } finally {
       runCost = 0;
+      runStartedAt = 0;
+      clearRetryTimer();
+      clearTickTimer();
       if (activeController === controller) activeController = undefined;
       redraw();
     }
@@ -349,22 +426,22 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
         }
         const next = parseModel(spec, { defaultProvider: target.providerId, defaultModel: target.modelId });
         if (!next || !cfg.getProviderRecord(next.providerId)) {
-          screen.pushLine(`✗ 模型无效或服务商未配置：${spec}`);
+          screen.pushKind('error', `模型无效或服务商未配置：${spec}`);
           break;
         }
         target = next;
-        screen.pushLine(`✓ 已切换模型：${target.providerId}/${target.modelId}`);
+        screen.pushKind('ok', `已切换模型：${target.providerId}/${target.modelId}`);
         break;
       }
       case '/cost':
         screen.pushLine(`本次 token：输入 ${runTokensIn} / 输出 ${runTokensOut}；累计花费：${formatMoney(cumulativeCost)}`);
         break;
       case '/help':
-        screen.pushLine('/exit 退出 · /clear 清屏 · /model 选择/切换模型 · /cost 查看费用 · /help 帮助');
-        screen.pushLine('Ctrl/Alt+←→ 按词跳转 · Ctrl+W 删词 · PageUp/PageDown 翻看历史输出 · Ctrl+L 清屏');
+        screen.pushKind('muted', '/exit 退出 · /clear 清屏 · /model 选择/切换模型 · /cost 查看费用 · /help 帮助');
+        screen.pushKind('muted', 'Ctrl/Alt+←→ 按词跳转 · Ctrl+W 删词 · PageUp/PageDown 翻看历史输出 · End 回到底部 · Ctrl+L 清屏');
         break;
       default:
-        screen.pushLine(`未知命令：${name}。输入 /help 查看可用命令。`);
+        screen.pushKind('warn', `未知命令：${name}。输入 /help 查看可用命令。`);
     }
   };
 
@@ -380,7 +457,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       }
     }
     if (options.length === 0) {
-      screen.pushLine('✗ 没有可切换的模型。运行 cf provider add <id> 先配置。');
+      screen.pushKind('error', '没有可切换的模型。运行 cf provider add <id> 先配置。');
       return;
     }
     pickerOptions = options;
@@ -432,7 +509,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
         closeModelPicker();
         if (!option) return;
         target = option;
-        screen.pushLine(`✓ 已切换模型：${target.providerId}/${target.modelId}`);
+        screen.pushKind('ok', `已切换模型：${target.providerId}/${target.modelId}`);
         break;
       }
       case 'escape':
@@ -454,9 +531,9 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     lastCtrlCAt = now;
     if (activeController) {
       activeController.abort();
-      screen.pushLine('! 正在中断，短时间内再次按 Ctrl+C 可退出');
+      screen.pushKind('warn', '正在中断，短时间内再次按 Ctrl+C 可退出');
     } else {
-      screen.pushLine('再次按 Ctrl+C 退出');
+      screen.pushKind('muted', '再次按 Ctrl+C 退出');
     }
     redraw();
   };
@@ -477,6 +554,22 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       const decoded = decodeKey(pendingInput);
       if (decoded.consumed === 0) return;
       pendingInput = pendingInput.subarray(decoded.consumed);
+      if (drawer.open) {
+        // 抽屉打开期间接管全部按键；机制与模型选择器一致
+        const result = drawer.handleKey(decoded.key);
+        if (result.type === 'answer') {
+          settlePermission(result.answer);
+        } else if (result.type === 'ask_reason') {
+          screen.setOverlay(undefined);
+          reasonMode = true;
+          input.clear();
+          screen.setInputPrompt(`${paint(FG.yellow, '原因：')} `);
+        } else {
+          screen.setOverlay(drawer.render(term.size().cols));
+        }
+        redraw();
+        continue;
+      }
       if (pickerOpen) {
         // 选择器打开期间接管一切按键（含 ctrl-c：关选择器而不是退出）
         handlePickerKey(decoded.key);
@@ -498,19 +591,36 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
       } else if (decoded.key === 'paste-start') {
         pasteMode = true;
       } else if (decoded.key === 'ctrl-c') {
+        // 抽屉/原因输入挂着时先结算成拒绝，避免 Promise 悬着，再走中断逻辑
+        if (drawer.open) {
+          drawer.close();
+          settlePermission({ decision: 'deny' });
+        }
+        if (reasonMode) {
+          reasonMode = false;
+          settlePermission({ decision: 'deny' });
+        }
         handleCtrlC();
       } else if (decoded.key === 'ctrl-d') {
         if (!input.value) requestExit();
         else input.deleteForward();
       } else if (decoded.key === 'enter') {
-        if (activeController) {
-          screen.pushLine('! 当前任务仍在运行，可按 Ctrl+C 中断');
+        if (reasonMode) {
+          reasonMode = false;
+          settlePermission({ decision: 'deny', reason: input.commit() });
+        } else if (activeController) {
+          screen.pushKind('warn', '当前任务仍在运行，可按 Ctrl+C 中断');
         } else {
           submit(input.commit());
         }
+      } else if (reasonMode && decoded.key === 'escape') {
+        reasonMode = false;
+        settlePermission({ decision: 'deny' });
       } else if (decoded.key === 'pageup' || decoded.key === 'pagedown') {
         const page = Math.max(3, term.size().rows - 4);
         screen.scrollBy(decoded.key === 'pageup' ? page : -page);
+      } else if (decoded.key === 'end') {
+        screen.resetScroll();
       } else if (decoded.key === 'clear-screen') {
         screen.clear();
       } else {
@@ -528,6 +638,7 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
 
   const removeResize = term.onResize((size) => {
     screen.resize(size);
+    if (drawer.open) screen.setOverlay(drawer.render(size.cols));
     redraw();
   });
   const mcpConfigs = mergeMcpConfigs(cfg.listMcpServers(), loadProjectMcp(workingDir));
@@ -560,9 +671,24 @@ export async function replCommand(cfg: AppConfig): Promise<number> {
     rawModeEntered = true;
     term.hideCursor();
     for (const tool of mcp.tools) tools.register(tool);
-    screen.pushLine('Confluence TUI · Agent 模式');
-    screen.pushLine('输入任务并回车，输入 /help 查看命令，双击 Ctrl+C 退出。');
-    for (const failure of mcp.failures) screen.pushLine(`! MCP 服务器 ${failure.name} 启动失败：${failure.error.userMessage}`);
+    for (const line of renderBanner(
+      {
+        version: VERSION,
+        model: `${target.providerId}/${target.modelId}`,
+        modelCount: countSwitchableModels(),
+        mode: profile.mode,
+        cwd: workingDir.replace(homedir(), '~'),
+        sandbox: sandboxKind,
+        firstRun: !hasUsableProvider,
+        secretBackend: secretBackendLabel(),
+      },
+      term.size().cols,
+    )) {
+      screen.pushRaw(line);
+    }
+    for (const failure of mcp.failures) {
+      screen.pushKind('warn', `MCP 服务器 ${failure.name} 启动失败：${failure.error.userMessage}`);
+    }
     attachInput();
     redraw();
     await exitRequested;
@@ -593,7 +719,7 @@ function renderEvent(event: AgentEvent, context: EventRenderContext): void {
   switch (event.type) {
     case 'step_start':
       context.onStepStart();
-      if (event.step > 1) context.screen.pushLine(`── 第 ${event.step} 步 ──`);
+      if (event.step > 1) context.screen.pushKind('muted', `── 第 ${event.step} 步 ──`);
       break;
     case 'model_stream':
       if (event.event.type === 'reasoning_delta') context.onReasoning();
@@ -603,30 +729,33 @@ function renderEvent(event: AgentEvent, context: EventRenderContext): void {
       }
       break;
     case 'tool_start':
-      context.screen.pushLine(`▸ ${event.name} ${oneLine(event.args)}`);
+      context.screen.pushKind('tool-call', `${event.name} ${oneLine(event.args)}`);
       break;
     case 'tool_output':
       if (!context.toolOutputs.has(event.callId)) {
-        context.screen.pushLine('');
+        context.screen.pushKind('tool-out', '');
         context.toolOutputs.add(event.callId);
       }
-      context.screen.appendToLast(event.chunk);
+      context.screen.appendToLast(event.chunk, 'tool-out');
       break;
     case 'tool_end':
-      context.screen.pushLine(`${event.ok ? '✓' : '✗'} ${event.summary} (${event.durationMs}ms)`);
+      context.screen.pushKind(event.ok ? 'ok' : 'error', event.summary, `(${event.durationMs}ms)`);
       break;
     case 'file_changed':
-      context.screen.pushMutedLine(`  ✎ ${event.op} ${event.path}`);
+      context.screen.pushKind('file-changed', `${event.op} ${event.path}`);
       if (event.diff) context.screen.pushDiff(event.diff);
       break;
     case 'compaction':
-      context.screen.pushLine(`! 上下文已压缩（折叠 ${event.removedMessages} 条消息）`);
+      context.screen.pushKind('reasoning', `上下文已压缩（折叠 ${event.removedMessages} 条消息）`);
       break;
     case 'notice':
-      context.screen.pushLine(`${event.level === 'warn' ? '!' : '·'} ${event.message}`);
+      context.screen.pushKind(event.level === 'warn' ? 'warn' : 'muted', event.message);
       break;
     case 'permission_resolved':
-      context.screen.pushLine(event.allowed ? '✓ 已授权工具操作' : `✗ 已拒绝工具操作${event.reason ? `：${event.reason}` : ''}`);
+      context.screen.pushKind(
+        event.allowed ? 'ok' : 'error',
+        event.allowed ? '已授权工具操作' : `已拒绝工具操作${event.reason ? `：${event.reason}` : ''}`,
+      );
       break;
     case 'permission_request':
     case 'checkpoint':

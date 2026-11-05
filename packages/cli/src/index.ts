@@ -10,8 +10,7 @@ import { providerCommand, flag } from './commands/provider.js';
 import { runCommand } from './commands/run.js';
 import { replCommand } from './tui/repl.js';
 import { c, err, heading, kv, line, table } from './ui.js';
-
-const VERSION = '0.1.0';
+import { VERSION } from './version.js';
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
